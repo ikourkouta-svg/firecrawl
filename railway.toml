@@ -1,6 +1,6 @@
 [build]
 builder = "DOCKERFILE"
-dockerfilePath = "apps/api/Dockerfile"
+dockerfilePath = "apps/api/Dockerfile.railway"
 watchPatterns = ["apps/api/**"]
 
 [deploy]
