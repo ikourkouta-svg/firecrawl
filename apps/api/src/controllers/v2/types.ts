@@ -1443,7 +1443,7 @@ export const searchRequestSchema = z
     location: z.string().optional(),
     origin: z.string().optional().default("api"),
     integration: integrationSchema.optional().transform(val => val || null),
-    timeout: z.number().int().positive().finite().safe().default(60000),
+    timeout: z.number().int().positive().finite().safe().default(180000),
     ignoreInvalidURLs: z.boolean().optional().default(false),
     asyncScraping: z.boolean().optional().default(false),
     __searchPreviewToken: z.string().optional(),
