@@ -1671,9 +1671,9 @@ export const searchRequestSchema = z
     location: z.string().optional(),
     origin: z.string().optional().prefault("api"),
     integration: integrationSchema.optional().transform(val => val || null),
-    timeout: z.int().positive().finite().prefault(60000),
-    ignoreInvalidURLs: z.boolean().optional().prefault(false),
-    asyncScraping: z.boolean().optional().prefault(false),
+    timeout: z.number().int().positive().finite().safe().default(180000),
+    ignoreInvalidURLs: z.boolean().optional().default(false),
+    asyncScraping: z.boolean().optional().default(false),
     __searchPreviewToken: z.string().optional(),
     scrapeOptions: baseScrapeOptions
       .extend({

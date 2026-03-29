@@ -784,7 +784,7 @@ const scrapeRequestSchemaBase = baseScrapeOptions
     jsonOptions: extractOptionsWithAgent.optional(),
     origin: z.string().optional().prefault("api"),
     integration: integrationSchema.optional().transform(val => val || null),
-    timeout: z.int().positive().min(1000).prefault(30000),
+    timeout: z.number().int().positive().finite().safe().default(180000),
     zeroDataRetention: z.boolean().optional(),
   })
   .strict();
