@@ -1,18 +1,28 @@
-import { supabaseGetJobByIdOnlyData } from "../../lib/supabase-jobs";
+import { supabaseGetScrapeByIdOnlyData } from "../../lib/supabase-jobs";
 import { getJob } from "./crawl-status";
 import { logger as _logger } from "../../lib/logger";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 export async function scrapeStatusController(req: any, res: any) {
+  const uuidReg =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!req.params.jobId || !uuidReg.test(req.params.jobId)) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid crawl ID",
+    });
+  }
+
   const logger = _logger.child({
     module: "scrape-status",
     method: "scrapeStatusController",
     teamId: req.auth.team_id,
     jobId: req.params.jobId,
     scrapeId: req.params.jobId,
-    zeroDataRetention: req.acuc?.flags?.forceZDR,
+    zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
   });
 
-  if (req.acuc?.flags?.forceZDR) {
+  if (getScrapeZDR(req.acuc?.flags) === "forced") {
     return res.status(400).json({
       success: false,
       error:
@@ -20,7 +30,7 @@ export async function scrapeStatusController(req: any, res: any) {
     });
   }
 
-  const job = await supabaseGetJobByIdOnlyData(req.params.jobId, logger);
+  const job = await supabaseGetScrapeByIdOnlyData(req.params.jobId, logger);
 
   if (!job) {
     return res.status(404).json({

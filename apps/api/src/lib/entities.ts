@@ -1,4 +1,5 @@
 import type { Action } from "../controllers/v1/types";
+import type { BrandingProfile } from "../types/branding";
 
 export type PageOptions = {
   includeMarkdown?: boolean;
@@ -70,7 +71,13 @@ export class Document {
   actions?: {
     screenshots?: string[];
     scrapes?: ScrapeActionContent[];
+    javascriptReturns?: {
+      type: string;
+      value: unknown;
+    }[];
+    pdfs?: string[];
   };
+  branding?: BrandingProfile;
 
   index?: number;
   linksOnPage?: string[]; // Add this new field as a separate property
@@ -114,6 +121,7 @@ interface ImageSearchResult {
   imageHeight?: number;
   url?: string;
   position?: number;
+  answer?: string;
 }
 
 interface NewsSearchResult {
@@ -131,6 +139,7 @@ interface NewsSearchResult {
   links?: string[];
   screenshot?: string;
   metadata?: Record<string, any>;
+  answer?: string;
 }
 
 export interface WebSearchResult {
@@ -146,6 +155,7 @@ export interface WebSearchResult {
   links?: string[];
   screenshot?: string;
   metadata?: Record<string, any>;
+  answer?: string;
 }
 
 export type SearchResultType = "web" | "images" | "news";

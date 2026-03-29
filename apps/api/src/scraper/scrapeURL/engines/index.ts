@@ -1,10 +1,10 @@
 import { ScrapeActionContent } from "../../../lib/entities";
+import { config } from "../../../config";
 import { Meta } from "..";
 import { documentMaxReasonableTime, scrapeDocument } from "./document";
 import {
   fireEngineMaxReasonableTime,
   scrapeURLWithFireEngineChromeCDP,
-  scrapeURLWithFireEnginePlaywright,
   scrapeURLWithFireEngineTLSClient,
 } from "./fire-engine";
 import { pdfMaxReasonableTime, scrapePDF } from "./pdf";
@@ -14,18 +14,23 @@ import {
   scrapeURLWithPlaywright,
 } from "./playwright";
 import { indexMaxReasonableTime, scrapeURLWithIndex } from "./index/index";
-import { useIndex } from "../../../services";
+import {
+  scrapeURLWithWikipedia,
+  wikipediaMaxReasonableTime,
+  isWikimediaUrl,
+} from "./wikipedia";
+import { queryEngpickerVerdict, useIndex } from "../../../services";
 import { hasFormatOfType } from "../../../lib/format-utils";
 import { getPDFMaxPages } from "../../../controllers/v2/types";
-import { PdfMetadata } from "@mendable/firecrawl-rs";
+import type { PdfMetadata } from "./pdf/types";
+import { BrandingProfile } from "../../../types/branding";
+import { BrandingNotSupportedError } from "../error";
 
 export type Engine =
   | "fire-engine;chrome-cdp"
   | "fire-engine(retry);chrome-cdp"
   | "fire-engine;chrome-cdp;stealth"
   | "fire-engine(retry);chrome-cdp;stealth"
-  | "fire-engine;playwright"
-  | "fire-engine;playwright;stealth"
   | "fire-engine;tlsclient"
   | "fire-engine;tlsclient;stealth"
   | "playwright"
@@ -33,16 +38,23 @@ export type Engine =
   | "pdf"
   | "document"
   | "index"
-  | "index;documents";
+  | "index;documents"
+  | "wikipedia";
 
 const useFireEngine =
-  process.env.FIRE_ENGINE_BETA_URL !== "" &&
-  process.env.FIRE_ENGINE_BETA_URL !== undefined;
+  config.FIRE_ENGINE_BETA_URL !== "" &&
+  config.FIRE_ENGINE_BETA_URL !== undefined;
 const usePlaywright =
-  process.env.PLAYWRIGHT_MICROSERVICE_URL !== "" &&
-  process.env.PLAYWRIGHT_MICROSERVICE_URL !== undefined;
+  config.PLAYWRIGHT_MICROSERVICE_URL !== "" &&
+  config.PLAYWRIGHT_MICROSERVICE_URL !== undefined;
+const useWikipedia =
+  config.WIKIPEDIA_ENTERPRISE_USERNAME !== undefined &&
+  config.WIKIPEDIA_ENTERPRISE_USERNAME !== "" &&
+  config.WIKIPEDIA_ENTERPRISE_PASSWORD !== undefined &&
+  config.WIKIPEDIA_ENTERPRISE_PASSWORD !== "";
 
 const engines: Engine[] = [
+  ...(useWikipedia ? ["wikipedia" as const] : []),
   ...(useIndex ? ["index" as const, "index;documents" as const] : []),
   ...(useFireEngine
     ? [
@@ -50,8 +62,6 @@ const engines: Engine[] = [
         "fire-engine;chrome-cdp;stealth" as const,
         "fire-engine(retry);chrome-cdp" as const,
         "fire-engine(retry);chrome-cdp;stealth" as const,
-        "fire-engine;playwright" as const,
-        "fire-engine;playwright;stealth" as const,
         "fire-engine;tlsclient" as const,
         "fire-engine;tlsclient;stealth" as const,
       ]
@@ -75,6 +85,7 @@ const featureFlags = [
   "skipTlsVerification",
   "useFastMode",
   "stealthProxy",
+  "branding",
   "disableAdblock",
 ] as const;
 
@@ -97,6 +108,7 @@ const featureFlagOptions: {
   mobile: { priority: 10 },
   skipTlsVerification: { priority: 10 },
   stealthProxy: { priority: 20 },
+  branding: { priority: 20 }, // Requires CDP executeJavascript
   disableAdblock: { priority: 10 },
 } as const;
 
@@ -119,6 +131,8 @@ export type EngineScrapeResult = {
     pdfs: string[];
   };
 
+  branding?: BrandingProfile;
+
   pdfMetadata?: PdfMetadata;
 
   cacheInfo?: {
@@ -131,6 +145,7 @@ export type EngineScrapeResult = {
   postprocessorsUsed?: string[];
 
   proxyUsed: "basic" | "stealth";
+  timezone?: string;
 };
 
 const engineHandlers: {
@@ -142,14 +157,13 @@ const engineHandlers: {
   "fire-engine(retry);chrome-cdp": scrapeURLWithFireEngineChromeCDP,
   "fire-engine;chrome-cdp;stealth": scrapeURLWithFireEngineChromeCDP,
   "fire-engine(retry);chrome-cdp;stealth": scrapeURLWithFireEngineChromeCDP,
-  "fire-engine;playwright": scrapeURLWithFireEnginePlaywright,
-  "fire-engine;playwright;stealth": scrapeURLWithFireEnginePlaywright,
   "fire-engine;tlsclient": scrapeURLWithFireEngineTLSClient,
   "fire-engine;tlsclient;stealth": scrapeURLWithFireEngineTLSClient,
   playwright: scrapeURLWithPlaywright,
   fetch: scrapeURLWithFetch,
   pdf: scrapePDF,
   document: scrapeDocument,
+  wikipedia: scrapeURLWithWikipedia,
 };
 
 const engineMRTs: {
@@ -165,10 +179,6 @@ const engineMRTs: {
     fireEngineMaxReasonableTime(meta, "chrome-cdp"),
   "fire-engine(retry);chrome-cdp;stealth": meta =>
     fireEngineMaxReasonableTime(meta, "chrome-cdp"),
-  "fire-engine;playwright": meta =>
-    fireEngineMaxReasonableTime(meta, "playwright"),
-  "fire-engine;playwright;stealth": meta =>
-    fireEngineMaxReasonableTime(meta, "playwright"),
   "fire-engine;tlsclient": meta =>
     fireEngineMaxReasonableTime(meta, "tlsclient"),
   "fire-engine;tlsclient;stealth": meta =>
@@ -177,6 +187,7 @@ const engineMRTs: {
   fetch: fetchMaxReasonableTime,
   pdf: pdfMaxReasonableTime,
   document: documentMaxReasonableTime,
+  wikipedia: wikipediaMaxReasonableTime,
 };
 
 const engineOptions: {
@@ -202,7 +213,8 @@ const engineOptions: {
       location: true,
       skipTlsVerification: true,
       useFastMode: true,
-      stealthProxy: false,
+      stealthProxy: true,
+      branding: false,
       disableAdblock: true,
     },
     quality: 1000, // index should always be tried first
@@ -221,6 +233,7 @@ const engineOptions: {
       skipTlsVerification: true,
       useFastMode: false,
       stealthProxy: false,
+      branding: true,
       disableAdblock: false,
     },
     quality: 50,
@@ -239,6 +252,7 @@ const engineOptions: {
       skipTlsVerification: true,
       useFastMode: false,
       stealthProxy: false,
+      branding: true,
       disableAdblock: false,
     },
     quality: 45,
@@ -256,7 +270,8 @@ const engineOptions: {
       mobile: true,
       skipTlsVerification: true,
       useFastMode: true,
-      stealthProxy: false,
+      stealthProxy: true,
+      branding: false,
       disableAdblock: false,
     },
     quality: -1,
@@ -275,6 +290,7 @@ const engineOptions: {
       skipTlsVerification: true,
       useFastMode: false,
       stealthProxy: true,
+      branding: true,
       disableAdblock: false,
     },
     quality: -2,
@@ -293,45 +309,10 @@ const engineOptions: {
       skipTlsVerification: true,
       useFastMode: false,
       stealthProxy: true,
+      branding: true,
       disableAdblock: false,
     },
     quality: -5,
-  },
-  "fire-engine;playwright": {
-    features: {
-      actions: false,
-      waitFor: true,
-      screenshot: true,
-      "screenshot@fullScreen": true,
-      pdf: false,
-      document: false,
-      atsv: false,
-      location: false,
-      mobile: false,
-      skipTlsVerification: false,
-      useFastMode: false,
-      stealthProxy: false,
-      disableAdblock: true,
-    },
-    quality: 40,
-  },
-  "fire-engine;playwright;stealth": {
-    features: {
-      actions: false,
-      waitFor: true,
-      screenshot: true,
-      "screenshot@fullScreen": true,
-      pdf: false,
-      document: false,
-      atsv: false,
-      location: false,
-      mobile: false,
-      skipTlsVerification: false,
-      useFastMode: false,
-      stealthProxy: true,
-      disableAdblock: true,
-    },
-    quality: -10,
   },
   playwright: {
     features: {
@@ -347,6 +328,7 @@ const engineOptions: {
       skipTlsVerification: true,
       useFastMode: false,
       stealthProxy: false,
+      branding: false,
       disableAdblock: false,
     },
     quality: 20,
@@ -365,6 +347,7 @@ const engineOptions: {
       skipTlsVerification: true,
       useFastMode: true,
       stealthProxy: false,
+      branding: false,
       disableAdblock: false,
     },
     quality: 10,
@@ -383,6 +366,7 @@ const engineOptions: {
       skipTlsVerification: true,
       useFastMode: true,
       stealthProxy: true,
+      branding: false,
       disableAdblock: false,
     },
     quality: -15,
@@ -401,6 +385,7 @@ const engineOptions: {
       skipTlsVerification: true,
       useFastMode: true,
       stealthProxy: false,
+      branding: false,
       disableAdblock: false,
     },
     quality: 5,
@@ -419,6 +404,7 @@ const engineOptions: {
       skipTlsVerification: false,
       useFastMode: true,
       stealthProxy: true, // kinda...
+      branding: false,
       disableAdblock: true,
     },
     quality: -20,
@@ -437,32 +423,67 @@ const engineOptions: {
       skipTlsVerification: false,
       useFastMode: true,
       stealthProxy: true, // kinda...
+      branding: false,
       disableAdblock: true,
     },
     quality: -20,
   },
+  wikipedia: {
+    features: {
+      actions: false,
+      waitFor: false,
+      screenshot: false,
+      "screenshot@fullScreen": false,
+      pdf: false,
+      document: false,
+      atsv: false,
+      location: false,
+      mobile: false,
+      skipTlsVerification: true,
+      useFastMode: true,
+      stealthProxy: false,
+      branding: false,
+      disableAdblock: true,
+    },
+    quality: 500, // below index (1000) so cache is tried first, above fire-engine (50)
+  },
 };
 
 export function shouldUseIndex(meta: Meta) {
+  // Skip index if screenshot format has custom viewport or quality settings
+  const screenshotFormat = hasFormatOfType(meta.options.formats, "screenshot");
+  const hasCustomScreenshotSettings =
+    screenshotFormat?.viewport !== undefined ||
+    screenshotFormat?.quality !== undefined;
+
   return (
     useIndex &&
-    process.env.FIRECRAWL_INDEX_WRITE_ONLY !== "true" &&
-    meta.options.waitFor === 0 &&
+    config.FIRECRAWL_INDEX_WRITE_ONLY !== true &&
     !hasFormatOfType(meta.options.formats, "changeTracking") &&
+    !hasFormatOfType(meta.options.formats, "branding") &&
     // Skip index if a non-default PDF maxPages is specified
     getPDFMaxPages(meta.options.parsers) === undefined &&
+    !hasCustomScreenshotSettings &&
     meta.options.maxAge !== 0 &&
     (meta.options.headers === undefined ||
       Object.keys(meta.options.headers).length === 0) &&
     (meta.options.actions === undefined || meta.options.actions.length === 0) &&
-    meta.options.proxy !== "stealth"
+    meta.options.profile === undefined
   );
 }
 
-export function buildFallbackList(meta: Meta): {
-  engine: Engine;
-  unsupportedFeatures: Set<FeatureFlag>;
-}[] {
+export async function buildFallbackList(meta: Meta): Promise<
+  {
+    engine: Engine;
+    unsupportedFeatures: Set<FeatureFlag>;
+  }[]
+> {
+  const shouldPrioritizeTlsClient = meta.options.__experimental_engpicker
+    ? (await queryEngpickerVerdict(
+        meta.options.__experimental_omceDomain ?? new URL(meta.url).hostname,
+      )) === "TlsClientOk"
+    : false;
+
   const _engines: Engine[] = [
     ...engines,
 
@@ -473,15 +494,18 @@ export function buildFallbackList(meta: Meta): {
           "fire-engine(retry);chrome-cdp",
           "fire-engine;chrome-cdp;stealth",
           "fire-engine(retry);chrome-cdp;stealth",
-          "fire-engine;playwright",
           // "fire-engine;tlsclient",
-          // "fire-engine;playwright;stealth",
           // "fire-engine;tlsclient;stealth",
         ] as Engine[])
       : []),
   ];
 
-  if (!shouldUseIndex(meta)) {
+  if (meta.internalOptions.agentIndexOnly) {
+    const indexEngines: Engine[] = useIndex ? ["index", "index;documents"] : [];
+    _engines.length = 0;
+    _engines.push(...indexEngines);
+    meta.internalOptions.forceEngine = indexEngines;
+  } else if (!shouldUseIndex(meta)) {
     const indexIndex = _engines.indexOf("index");
     if (indexIndex !== -1) {
       _engines.splice(indexIndex, 1);
@@ -489,6 +513,13 @@ export function buildFallbackList(meta: Meta): {
     const indexDocumentsIndex = _engines.indexOf("index;documents");
     if (indexDocumentsIndex !== -1) {
       _engines.splice(indexDocumentsIndex, 1);
+    }
+  }
+
+  if (!isWikimediaUrl(meta.url)) {
+    const wikiIndex = _engines.indexOf("wikipedia");
+    if (wikiIndex !== -1) {
+      _engines.splice(wikiIndex, 1);
     }
   }
 
@@ -535,7 +566,11 @@ export function buildFallbackList(meta: Meta): {
     }
   }
 
-  if (selectedEngines.some(x => engineOptions[x.engine].quality > 0)) {
+  if (
+    selectedEngines.some(
+      x => engineOptions[x.engine].quality > 0 && !x.engine.startsWith("index"),
+    )
+  ) {
     selectedEngines = selectedEngines.filter(
       x => engineOptions[x.engine].quality > 0,
     );
@@ -543,16 +578,50 @@ export function buildFallbackList(meta: Meta): {
 
   if (meta.internalOptions.forceEngine === undefined) {
     // retain force engine order
+    // THIS SUCKS BUT IT WORKS
+    const getEffectiveQuality = (engine: Engine) => {
+      let quality = engineOptions[engine].quality;
+      // When engpicker says TlsClientOk, prioritize tlsclient over CDP/CDPRetry
+      if (shouldPrioritizeTlsClient) {
+        if (engine === "fire-engine;tlsclient") {
+          quality += 50; // Boost to 60, above CDP (50) but below index (1000)
+        } else if (engine === "fire-engine;tlsclient;stealth") {
+          quality += 14; // Boost to -1, stays negative but above chrome-cdp;stealth (-2)
+        }
+      }
+      return quality;
+    };
+
     selectedEngines.sort(
       (a, b) =>
         b.supportScore - a.supportScore ||
-        engineOptions[b.engine].quality - engineOptions[a.engine].quality,
+        getEffectiveQuality(b.engine) - getEffectiveQuality(a.engine),
     );
   }
 
   meta.logger.info("Selected engines", {
     selectedEngines,
   });
+
+  if (meta.featureFlags.has("branding")) {
+    const hasCDPEngine = selectedEngines.some(
+      f => !f.unsupportedFeatures.has("branding"),
+    );
+    if (!hasCDPEngine) {
+      if (meta.featureFlags.has("pdf")) {
+        throw new BrandingNotSupportedError(
+          "Branding extraction is only supported for HTML web pages. PDFs are not supported.",
+        );
+      } else if (meta.featureFlags.has("document")) {
+        throw new BrandingNotSupportedError(
+          "Branding extraction is only supported for HTML web pages. Documents (docx, xlsx, etc.) are not supported.",
+        );
+      }
+      throw new BrandingNotSupportedError(
+        "Branding extraction requires Chrome CDP (fire-engine).",
+      );
+    }
+  }
 
   return selectedEngines;
 }
@@ -566,9 +635,19 @@ export async function scrapeURLWithEngine(
     method: fn.name ?? "scrapeURLWithEngine",
     engine,
   });
+
+  const featureFlags = new Set(meta.featureFlags);
+  if (
+    engineOptions[engine].features.stealthProxy &&
+    !engine.startsWith("index") // don't force stealth proxy for index
+  ) {
+    featureFlags.add("stealthProxy");
+  }
+
   const _meta = {
     ...meta,
     logger,
+    featureFlags,
   };
 
   return await fn(_meta);

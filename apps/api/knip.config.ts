@@ -7,8 +7,11 @@ const config: KnipConfig = {
       project: ["src/**/*.ts"],
     },
   },
-  ignore: ["native/**"],
-  ignoreDependencies: ["openai"],
+  ignore: [
+    "native/**",
+    "src/scraper/scrapeURL/engines/fire-engine/branding-script/**",
+  ],
+  ignoreDependencies: ["openai", "undici-types"],
 };
 
 export default config;

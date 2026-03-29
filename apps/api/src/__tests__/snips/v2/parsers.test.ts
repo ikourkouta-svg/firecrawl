@@ -1,3 +1,8 @@
+import {
+  ALLOW_TEST_SUITE_WEBSITE,
+  describeIf,
+  TEST_SUITE_WEBSITE,
+} from "../lib";
 import { scrape, scrapeRaw, scrapeTimeout, idmux, Identity } from "./lib";
 
 let identity: Identity;
@@ -10,9 +15,9 @@ beforeAll(async () => {
   });
 }, 10000 + scrapeTimeout);
 
-describe("Parsers parameter tests", () => {
-  const pdfUrl = "https://www.orimi.com/pdf-test.pdf";
-  const htmlUrl = "https://firecrawl.dev";
+describeIf(ALLOW_TEST_SUITE_WEBSITE)("Parsers parameter tests", () => {
+  const pdfUrl = `${TEST_SUITE_WEBSITE}/example.pdf`;
+  const htmlUrl = TEST_SUITE_WEBSITE;
 
   describe("Array format", () => {
     it.concurrent(
@@ -142,6 +147,80 @@ describe("Parsers parameter tests", () => {
     );
   });
 
+  describe("Mode - object format", () => {
+    it.concurrent(
+      "accepts mode: 'fast' and parses PDF with Rust parser",
+      async () => {
+        const response = await scrape(
+          {
+            url: pdfUrl,
+            parsers: [{ type: "pdf", mode: "fast" }],
+          },
+          identity,
+        );
+
+        expect(response.markdown).toBeDefined();
+        expect(response.markdown).toContain("PDF Test File");
+        expect(response.metadata.numPages).toBeGreaterThan(0);
+      },
+      scrapeTimeout * 2,
+    );
+
+    it.concurrent(
+      "accepts mode: 'auto' and parses PDF",
+      async () => {
+        const response = await scrape(
+          {
+            url: pdfUrl,
+            parsers: [{ type: "pdf", mode: "auto" }],
+          },
+          identity,
+        );
+
+        expect(response.markdown).toBeDefined();
+        expect(response.markdown).toContain("PDF Test File");
+        expect(response.metadata.numPages).toBeGreaterThan(0);
+      },
+      scrapeTimeout * 2,
+    );
+
+    it.concurrent(
+      "accepts mode: 'ocr' and parses PDF via OCR",
+      async () => {
+        const response = await scrape(
+          {
+            url: pdfUrl,
+            parsers: [{ type: "pdf", mode: "ocr" }],
+          },
+          identity,
+        );
+
+        expect(response.markdown).toBeDefined();
+        expect(response.markdown).toContain("PDF Test File");
+        expect(response.metadata.numPages).toBeGreaterThan(0);
+      },
+      scrapeTimeout * 2,
+    );
+
+    it.concurrent(
+      "accepts mode with maxPages combined",
+      async () => {
+        const response = await scrape(
+          {
+            url: pdfUrl,
+            parsers: [{ type: "pdf", mode: "fast", maxPages: 1 }],
+          },
+          identity,
+        );
+
+        expect(response.markdown).toBeDefined();
+        expect(response.markdown).toContain("PDF Test File");
+        expect(response.metadata.numPages).toBe(1);
+      },
+      scrapeTimeout * 2,
+    );
+  });
+
   describe("Default behavior", () => {
     it.concurrent(
       "parses PDF by default when parsers not specified",
@@ -241,6 +320,42 @@ describe("Parsers parameter tests", () => {
           {
             url: pdfUrl,
             parsers: [{ type: "pdf", maxPages: 10001 }],
+          },
+          identity,
+        );
+
+        expect(raw.statusCode).toBe(400);
+        expect(raw.body.success).toBe(false);
+        expect(raw.body.error).toBe("Bad Request");
+      },
+      scrapeTimeout,
+    );
+
+    it.concurrent(
+      "rejects invalid mode in object format",
+      async () => {
+        const raw = await scrapeRaw(
+          {
+            url: pdfUrl,
+            parsers: [{ type: "pdf", mode: "invalid" } as any],
+          },
+          identity,
+        );
+
+        expect(raw.statusCode).toBe(400);
+        expect(raw.body.success).toBe(false);
+        expect(raw.body.error).toBe("Bad Request");
+      },
+      scrapeTimeout,
+    );
+
+    it.concurrent(
+      "rejects colon-separated shorthand strings",
+      async () => {
+        const raw = await scrapeRaw(
+          {
+            url: pdfUrl,
+            parsers: ["pdf:fast" as any],
           },
           identity,
         );

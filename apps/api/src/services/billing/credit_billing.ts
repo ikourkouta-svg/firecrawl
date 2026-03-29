@@ -8,10 +8,9 @@ import { AuthCreditUsageChunk } from "../../controllers/v1/types";
 import { autoCharge } from "./auto_charge";
 import { getValue, setValue } from "../redis";
 import { queueBillingOperation } from "./batch_billing";
+import { autumnService } from "../autumn/autumn.service";
+import { toAutumnBillingProperties, type BillingMetadata } from "./types";
 import type { Logger } from "winston";
-
-// Deprecated, done via rpc
-const FREE_CREDITS = 500;
 
 /**
  * If you do not know the subscription_id in the current context, pass subscription_id as undefined.
@@ -21,30 +20,52 @@ export async function billTeam(
   subscription_id: string | null | undefined,
   credits: number,
   api_key_id: number | null,
+  billing: BillingMetadata,
   logger?: Logger,
-  is_extract: boolean = false,
 ) {
-  // Maintain the withAuth wrapper for authentication
   return withAuth(
     async (
       team_id: string,
       subscription_id: string | null | undefined,
       credits: number,
       api_key_id: number | null,
+      billing: BillingMetadata,
       logger: Logger | undefined,
-      is_extract: boolean,
     ) => {
-      // Within the authenticated context, queue the billing operation
-      return queueBillingOperation(
+      const autumnProperties = {
+        source: "billTeam",
+        ...toAutumnBillingProperties(billing),
+        apiKeyId: api_key_id,
+      };
+      const trackedInRequest = await autumnService.trackCredits({
+        teamId: team_id,
+        value: credits,
+        properties: autumnProperties,
+        requestScoped: true,
+      });
+
+      const result = await queueBillingOperation(
         team_id,
         subscription_id,
         credits,
         api_key_id,
-        is_extract,
+        billing,
+        false,
+        trackedInRequest,
       );
+
+      if (!result.success && trackedInRequest) {
+        await autumnService.refundCredits({
+          teamId: team_id,
+          value: credits,
+          properties: autumnProperties,
+        });
+      }
+
+      return result;
     },
     { success: true, message: "No DB, bypassed." },
-  )(team_id, subscription_id, credits, api_key_id, logger, is_extract);
+  )(team_id, subscription_id, credits, api_key_id, billing, logger);
 }
 
 type CheckTeamCreditsResponse = {
@@ -66,6 +87,33 @@ export async function checkTeamCredits(
   })(chunk, team_id, credits);
 }
 
+function evaluateTeamCredits(
+  chunk: AuthCreditUsageChunk,
+  credits: number,
+  isAutoRechargeEnabled: boolean,
+) {
+  const allowOverages =
+    chunk.price_should_be_graceful && isAutoRechargeEnabled;
+  const remainingCredits = allowOverages
+    ? chunk.remaining_credits + chunk.price_credits
+    : chunk.remaining_credits;
+  const creditsWillBeUsed = chunk.adjusted_credits_used + credits;
+  const totalPriceCredits = allowOverages
+    ? (chunk.total_credits_sum ?? 100000000) + chunk.price_credits
+    : (chunk.total_credits_sum ?? 100000000);
+  const creditUsagePercentage =
+    chunk.adjusted_credits_used / (chunk.total_credits_sum ?? 100000000);
+
+  return {
+    allowOverages,
+    remainingCredits,
+    creditsWillBeUsed,
+    totalPriceCredits,
+    creditUsagePercentage,
+    success: creditsWillBeUsed <= totalPriceCredits,
+  };
+}
+
 // if team has enough credits for the operation, return true, else return false
 async function supaCheckTeamCredits(
   chunk: AuthCreditUsageChunk | null,
@@ -83,20 +131,15 @@ async function supaCheckTeamCredits(
     throw new Error("NULL ACUC passed to supaCheckTeamCredits");
   }
 
-  const remainingCredits = chunk.price_should_be_graceful
-    ? chunk.remaining_credits + chunk.price_credits
-    : chunk.remaining_credits;
-
-  const creditsWillBeUsed = chunk.adjusted_credits_used + credits;
-
-  // In case chunk.price_credits is undefined, set it to a large number to avoid mistakes
-  const totalPriceCredits = chunk.price_should_be_graceful
-    ? (chunk.total_credits_sum ?? 100000000) + chunk.price_credits
-    : (chunk.total_credits_sum ?? 100000000);
-
-  // Removal of + credits
-  const creditUsagePercentage =
-    chunk.adjusted_credits_used / (chunk.total_credits_sum ?? 100000000);
+  // If bypassCreditChecks flag is set, return success with infinite credits (infinitely graceful)
+  if (chunk.flags?.bypassCreditChecks) {
+    return {
+      success: true,
+      message: "Credit checks bypassed",
+      remainingCredits: Infinity,
+      chunk,
+    };
+  }
 
   let isAutoRechargeEnabled = false,
     autoRechargeThreshold = 1000;
@@ -120,6 +163,15 @@ async function supaCheckTeamCredits(
     }
   }
 
+  const {
+    success,
+    allowOverages,
+    remainingCredits,
+    creditsWillBeUsed,
+    totalPriceCredits,
+    creditUsagePercentage,
+  } = evaluateTeamCredits(chunk, credits, isAutoRechargeEnabled);
+
   if (
     isAutoRechargeEnabled &&
     chunk.remaining_credits < autoRechargeThreshold &&
@@ -131,17 +183,19 @@ async function supaCheckTeamCredits(
       autoRechargeThreshold,
       remainingCredits: chunk.remaining_credits,
     });
+
     const autoChargeResult = await autoCharge(chunk, autoRechargeThreshold);
-    if (autoChargeResult.success) {
+
+    if (autoChargeResult && autoChargeResult.success) {
       return {
         success: true,
         message: autoChargeResult.message,
-        remainingCredits: chunk.price_should_be_graceful
+        remainingCredits: allowOverages
           ? autoChargeResult.remainingCredits + chunk.price_credits
           : autoChargeResult.remainingCredits,
         chunk: autoChargeResult.chunk,
       };
-    } else if (chunk.price_should_be_graceful) {
+    } else if (allowOverages) {
       return {
         success: true,
         message: "Auto-recharge failed, but price should be graceful",
@@ -172,7 +226,31 @@ async function supaCheckTeamCredits(
   }
 
   // Compare the adjusted total credits used with the credits allowed by the plan (and graceful)
-  if (creditsWillBeUsed > totalPriceCredits) {
+  if (!success) {
+    logger.warn("Credit check failed - insufficient credits", {
+      team_id,
+      teamId: team_id,
+      creditsRequested: credits,
+      is_extract: chunk.is_extract,
+      bypassCreditChecks: chunk.flags?.bypassCreditChecks,
+      price_should_be_graceful: chunk.price_should_be_graceful,
+      allowOverages,
+      price_credits: chunk.price_credits,
+      coupon_credits: chunk.coupon_credits,
+      total_credits_sum: chunk.total_credits_sum,
+      credits_used: chunk.credits_used,
+      adjusted_credits_used: chunk.adjusted_credits_used,
+      remaining_credits: chunk.remaining_credits,
+      sub_current_period_start: chunk.sub_current_period_start,
+      sub_current_period_end: chunk.sub_current_period_end,
+      computed_remainingCredits: remainingCredits,
+      computed_creditsWillBeUsed: creditsWillBeUsed,
+      computed_totalPriceCredits: totalPriceCredits,
+      creditUsagePercentage,
+      sumComponents: chunk.price_credits + chunk.coupon_credits,
+      isAutoRechargeEnabled,
+      autoRechargeThreshold,
+    });
     return {
       success: false,
       message:
@@ -185,7 +263,7 @@ async function supaCheckTeamCredits(
   return {
     success: true,
     message: "Sufficient credits available",
-    remainingCredits: chunk.remaining_credits,
+    remainingCredits,
     chunk,
   };
 }

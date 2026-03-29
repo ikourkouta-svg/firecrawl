@@ -1,7 +1,17 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { logger } from "../lib/logger";
 import { configDotenv } from "dotenv";
+import { config } from "../config";
+import { logger } from "../lib/logger";
 configDotenv();
+
+/** PostgREST code when .single() returns 0 or >1 rows. Use to distinguish "no row" from real DB errors. */
+const POSTGREST_NO_ROWS_CODE = "PGRST116";
+
+export function isPostgrestNoRowsError(
+  error: { code?: string } | null | undefined,
+): boolean {
+  return error?.code === POSTGREST_NO_ROWS_CODE;
+}
 
 // SupabaseService class initializes the Supabase client conditionally based on environment variables.
 class SupabaseService {
@@ -9,10 +19,10 @@ class SupabaseService {
   private rrClient: SupabaseClient | null = null;
 
   constructor() {
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseReplicaUrl = process.env.SUPABASE_REPLICA_URL;
-    const supabaseServiceToken = process.env.SUPABASE_SERVICE_TOKEN;
-    const useDbAuthentication = process.env.USE_DB_AUTHENTICATION === "true";
+    const supabaseUrl = config.SUPABASE_URL;
+    const supabaseReplicaUrl = config.SUPABASE_REPLICA_URL;
+    const supabaseServiceToken = config.SUPABASE_SERVICE_TOKEN;
+    const useDbAuthentication = config.USE_DB_AUTHENTICATION;
     // Only initialize the Supabase client if both URL and Service Token are provided.
     if (!useDbAuthentication) {
       // Warn the user that Authentication is disabled by setting the client to null
@@ -86,3 +96,4 @@ export const supabase_rr_service: SupabaseClient = new Proxy(serv, {
     return Reflect.get(client, prop, receiver);
   },
 }) as unknown as SupabaseClient;
+

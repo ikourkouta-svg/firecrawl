@@ -189,21 +189,18 @@ const containsRecursiveRef = (
 const resolveRefs = (
   obj: any,
   defs: any,
+  logger: Logger,
   visited = new WeakSet(),
   depth = 0,
 ): any => {
   if (!obj || typeof obj !== "object" || depth > 10) return obj;
 
-  const objString = JSON.stringify(obj);
-  if (objString.includes("#/$defs/") && objString.includes('"$ref"')) {
-    console.warn(
-      "resolveRefs: Detected recursive schema pattern, aborting to prevent infinite recursion",
+  if (visited.has(obj)) {
+    logger.warn(
+      "resolveRefs: Detected circular reference, aborting to prevent infinite recursion",
     );
     return obj;
   }
-
-  // Prevent infinite recursion
-  if (visited.has(obj)) return obj;
   visited.add(obj);
 
   if (obj.$ref && typeof obj.$ref === "string") {
@@ -212,7 +209,13 @@ const resolveRefs = (
     if (refPath[0] === "#" && refPath[1] === "$defs") {
       const defName = refPath[refPath.length - 1];
       if (defs[defName]) {
-        return resolveRefs({ ...defs[defName] }, defs, visited, depth + 1);
+        return resolveRefs(
+          { ...defs[defName] },
+          defs,
+          logger,
+          visited,
+          depth + 1,
+        );
       }
     }
     return obj; // Return original if ref can't be resolved
@@ -220,14 +223,14 @@ const resolveRefs = (
 
   // Handle arrays
   if (Array.isArray(obj)) {
-    return obj.map(item => resolveRefs(item, defs, visited, depth + 1));
+    return obj.map(item => resolveRefs(item, defs, logger, visited, depth + 1));
   }
 
   // Handle objects
   const resolved: any = {};
   for (const [key, value] of Object.entries(obj)) {
     if (key === "$defs") continue;
-    resolved[key] = resolveRefs(value, defs, visited, depth + 1);
+    resolved[key] = resolveRefs(value, defs, logger, visited, depth + 1);
   }
   return resolved;
 };
@@ -286,18 +289,45 @@ export async function extractData({
 
     if (hasAnyRefs) {
       logger.info(
-        "Detected schema with references, preserving as-is to avoid recursion",
+        "Detected schema with references, attempting to resolve refs",
         {
           hasDefsProperty: !!schema.$defs,
           hasRefInString: schemaString.includes('"$ref"'),
           hasRefPathInString: schemaString.includes("#/$defs/"),
         },
       );
+
+      try {
+        const resolvedSchema = resolveRefs(schema, defs, logger);
+
+        const resolvedString = JSON.stringify(resolvedSchema);
+        const hasRemainingRefs =
+          resolvedString.includes('"$ref"') ||
+          resolvedString.includes("#/$defs/");
+
+        if (!hasRemainingRefs) {
+          schema = resolvedSchema;
+          if (schema && typeof schema === "object" && schema.$defs)
+            delete schema.$defs;
+          logger.info("Successfully resolved schema refs", {
+            schema,
+          });
+        } else {
+          logger.info(
+            "Reference resolution was skipped or incomplete (remaining $ref detected), preserving original schema",
+          );
+        }
+      } catch (error) {
+        logger.warn(
+          "Failed to resolve schema refs, preserving original schema",
+          { error },
+        );
+      }
     } else {
       logger.info("No recursive references detected, resolving refs", {
         schema,
       });
-      schema = resolveRefs(schema, defs);
+      schema = resolveRefs(schema, defs, logger);
       delete schema.$defs;
       logger.info("Resolved schema refs", {
         schema,
@@ -413,8 +443,15 @@ export async function extractData({
       // console.log("scrapedPages", scrapedPages);
       const htmls = scrapedPages.flat().map(page => page.html);
       // console.log("htmls", htmls);
+      const requestId = extractId || scrapeId;
       const markdowns = await Promise.all(
-        htmls.map(async html => await parseMarkdown(html)),
+        htmls.map(
+          async html =>
+            await parseMarkdown(html, {
+              logger,
+              requestId,
+            }),
+        ),
       );
       // console.log("markdowns", markdowns);
       extractedData = await Promise.all(
@@ -422,8 +459,8 @@ export async function extractData({
           const newExtractOptions = {
             ...extractOptions,
             markdown: markdown,
-            model: getModel("gemini-2.5-pro", "vertex"),
-            retryModel: getModel("gemini-2.5-pro", "google"),
+            model: getModel("gpt-4o-mini", "openai"),
+            retryModel: getModel("gpt-4.1", "openai"),
             costTrackingOptions: {
               costTracking: extractOptions.costTrackingOptions.costTracking,
               metadata: {

@@ -1,31 +1,22 @@
-import { parseApi } from "../lib/parseApi";
-import { getRateLimiter } from "../services/rate-limiter";
-import { AuthResponse, NotificationType, RateLimiterMode } from "../types";
-import { supabase_rr_service, supabase_service } from "../services/supabase";
-import { withAuth } from "../lib/withAuth";
 import { RateLimiterRedis } from "rate-limiter-flexible";
-import { sendNotification } from "../services/notification/email_notification";
-import { logger } from "../lib/logger";
-import { redlock } from "../services/redlock";
-import { deleteKey, getValue } from "../services/redis";
-import { setValue } from "../services/redis";
 import { validate } from "uuid";
-import * as Sentry from "@sentry/node";
+import { config } from "../config";
+import { logger } from "../lib/logger";
+import { parseApi } from "../lib/parseApi";
+import { withAuth } from "../lib/withAuth";
+import { getAgentSponsorStatus } from "../services/agent-sponsor";
+import { getRedisConnection } from "../services/queue-service";
+import { getRateLimiter } from "../services/rate-limiter";
+import { deleteKey, getValue, setValue } from "../services/redis";
+import { redlock } from "../services/redlock";
+import { supabase_rr_service, supabase_service } from "../services/supabase";
+import { AuthResponse, RateLimiterMode } from "../types";
 import { AuthCreditUsageChunk, AuthCreditUsageChunkFromTeam } from "./v1/types";
-// const { data, error } = await supabase_service
-//     .from('api_keys')
-//     .select(`
-//       key,
-//       team_id,
-//       teams (
-//         subscriptions (
-//           price_id
-//         )
-//       )
-//     `)
-//     .eq('key', normalizedApi)
-//     .limit(1)
-//     .single();
+import {
+  isAutumnCheckEnabled,
+  AUTUMN_BYPASS_ORG_IDS,
+} from "../services/autumn/autumn.service";
+
 function normalizedApiIsUuid(potentialUuid: string): boolean {
   // Check if the string is a valid UUID
   return validate(potentialUuid);
@@ -160,13 +151,13 @@ export async function getACUC(
     mode === RateLimiterMode.ExtractStatus ||
     mode === RateLimiterMode.ExtractAgentPreview;
 
-  if (api_key === process.env.PREVIEW_TOKEN) {
+  if (api_key === config.PREVIEW_TOKEN) {
     const acuc = mockPreviewACUC(api_key, isExtract);
     acuc.is_extract = isExtract;
     return acuc;
   }
 
-  if (process.env.USE_DB_AUTHENTICATION !== "true") {
+  if (config.USE_DB_AUTHENTICATION !== true) {
     const acuc = mockACUC();
     acuc.is_extract = isExtract;
     return acuc;
@@ -190,7 +181,7 @@ export async function getACUC(
       const client =
         Math.random() > 2 / 3 ? supabase_rr_service : supabase_service;
       ({ data, error } = await client.rpc(
-        "auth_credit_usage_chunk_35",
+        "auth_credit_usage_chunk_46",
         {
           input_key: api_key,
           i_is_extract: isExtract,
@@ -292,7 +283,7 @@ export async function getACUCTeam(
     return acuc;
   }
 
-  if (process.env.USE_DB_AUTHENTICATION !== "true") {
+  if (config.USE_DB_AUTHENTICATION !== true) {
     const acuc = mockACUC();
     acuc.is_extract = isExtract;
     return acuc;
@@ -317,7 +308,7 @@ export async function getACUCTeam(
       const client =
         Math.random() > 2 / 3 ? supabase_rr_service : supabase_service;
       ({ data, error } = await client.rpc(
-        "auth_credit_usage_chunk_35_from_team",
+        "auth_credit_usage_chunk_46_from_team",
         {
           input_team: team_id,
           i_is_extract: isExtract,
@@ -386,6 +377,9 @@ export async function clearACUCTeam(team_id: string): Promise<void> {
 
   // Also clear the base cache key
   await deleteKey(`acuc_team_${team_id}`);
+
+  // Add team to billed_teams set so tally gets updated too
+  await getRedisConnection().sadd("billed_teams", team_id);
 }
 
 export async function authenticateUser(
@@ -397,7 +391,43 @@ export async function authenticateUser(
     success: true,
     chunk: null,
     team_id: "bypass",
+    org_id: null,
   })(req, res, mode);
+}
+
+/**
+ * Backfills org_id for stale cached auth chunks so Autumn check gating can run.
+ */
+async function ensureChunkOrgId(
+  apiKey: string,
+  chunk: AuthCreditUsageChunk | null,
+): Promise<AuthCreditUsageChunk | null> {
+  if (
+    !chunk ||
+    chunk.org_id ||
+    config.USE_DB_AUTHENTICATION !== true ||
+    (!isAutumnCheckEnabled() && AUTUMN_BYPASS_ORG_IDS.size === 0)
+  ) {
+    return chunk;
+  }
+
+  const { data, error } = await supabase_rr_service
+    .from("teams")
+    .select("org_id")
+    .eq("id", chunk.team_id)
+    .single();
+
+  if (error || !data?.org_id) {
+    logger.warn("Failed to backfill org_id for auth chunk", {
+      teamId: chunk.team_id,
+      error,
+    });
+    return chunk;
+  }
+
+  chunk.org_id = data.org_id;
+  await setCachedACUC(apiKey, !!chunk.is_extract, chunk);
+  return chunk;
 }
 
 async function supaAuthenticateUser(
@@ -439,7 +469,7 @@ async function supaAuthenticateUser(
       "Unauthenticated Playground calls are temporarily disabled due to abuse. Please sign up.",
     );
   }
-  if (token == process.env.PREVIEW_TOKEN) {
+  if (token == config.PREVIEW_TOKEN) {
     if (mode == RateLimiterMode.CrawlStatus) {
       rateLimiter = getRateLimiter(RateLimiterMode.CrawlStatus, token);
     } else if (mode == RateLimiterMode.ExtractStatus) {
@@ -458,7 +488,8 @@ async function supaAuthenticateUser(
       };
     }
 
-    chunk = await getACUC(normalizedApi, false, true, mode);
+    chunk = await getACUC(normalizedApi, false, true, RateLimiterMode.Scrape);
+    chunk = await ensureChunkOrgId(normalizedApi, chunk);
 
     if (chunk === null) {
       return {
@@ -480,26 +511,26 @@ async function supaAuthenticateUser(
     );
   }
 
-  const team_endpoint_token =
-    token === process.env.PREVIEW_TOKEN ? iptoken : teamId;
+  const team_endpoint_token = token === config.PREVIEW_TOKEN ? iptoken : teamId;
 
   try {
     await rateLimiter.consume(team_endpoint_token);
   } catch (rateLimiterRes) {
-    logger.error(`Rate limit exceeded: ${rateLimiterRes}`, {
-      teamId,
-      priceId,
-      mode,
-      rateLimits: chunk?.rate_limits,
-      rateLimiterRes,
-    });
+    // logger.error(`Rate limit exceeded: ${rateLimiterRes}`, {
+    //   teamId,
+    //   priceId,
+    //   mode,
+    //   rateLimits: chunk?.rate_limits,
+    //   rateLimiterRes,
+    // });
+
     const secs = Math.round(rateLimiterRes.msBeforeNext / 1000) || 1;
     const retryDate = new Date(Date.now() + rateLimiterRes.msBeforeNext);
 
     // We can only send a rate limit email every 7 days, send notification already has the date in between checking
-    const startDate = new Date();
-    const endDate = new Date();
-    endDate.setDate(endDate.getDate() + 7);
+    // const startDate = new Date();
+    // const endDate = new Date();
+    // endDate.setDate(endDate.getDate() + 7);
 
     // await sendNotification(team_id, NotificationType.RATE_LIMIT_REACHED, startDate.toISOString(), endDate.toISOString());
 
@@ -511,7 +542,7 @@ async function supaAuthenticateUser(
   }
 
   if (
-    token === process.env.PREVIEW_TOKEN &&
+    token === config.PREVIEW_TOKEN &&
     (mode === RateLimiterMode.Scrape ||
       mode === RateLimiterMode.Preview ||
       mode === RateLimiterMode.Map ||
@@ -523,6 +554,7 @@ async function supaAuthenticateUser(
     return {
       success: true,
       team_id: `preview_${iptoken}`,
+      org_id: null,
       chunk: null,
     };
     // check the origin of the request and make sure its from firecrawl.dev
@@ -530,16 +562,38 @@ async function supaAuthenticateUser(
     // if (origin && origin.includes("firecrawl.dev")){
     //   return { success: true, team_id: "preview" };
     // }
-    // if(process.env.ENV !== "production") {
+    // if(config.ENV !== "production") {
     //   return { success: true, team_id: "preview" };
     // }
 
     // return { success: false, error: "Unauthorized: Invalid token", status: 401 };
   }
 
+  // Check if this is an agent-provisioned key and attach sponsor status
+  if (chunk && chunk.api_key_id) {
+    try {
+      const sponsorStatus = await getAgentSponsorStatus({
+        apiKeyId: chunk.api_key_id,
+      });
+      if (sponsorStatus) {
+        chunk._agentSponsor = {
+          status: sponsorStatus.status,
+          verification_deadline: sponsorStatus.verification_deadline,
+          email: sponsorStatus.email,
+        };
+      }
+    } catch (err) {
+      logger.warn("Failed to check agent sponsor status", {
+        error: err,
+        api_key_id: chunk.api_key_id,
+      });
+    }
+  }
+
   return {
     success: true,
     team_id: teamId ?? undefined,
+    org_id: chunk?.org_id ?? null,
     chunk,
   };
 }

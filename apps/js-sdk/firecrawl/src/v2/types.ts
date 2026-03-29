@@ -11,7 +11,9 @@ export type FormatString =
   | 'summary'
   | 'changeTracking'
   | 'json'
-  | 'attributes';
+  | 'attributes'
+  | 'branding'
+  | 'audio';
 
 export interface Viewport {
   width: number;
@@ -50,13 +52,19 @@ export interface AttributesFormat extends Format {
   }>;
 }
 
+export interface QueryFormat {
+  type: 'query';
+  prompt: string;
+}
+
 export type FormatOption =
   | FormatString
   | Format
   | JsonFormat
   | ChangeTrackingFormat
   | ScreenshotFormat
-  | AttributesFormat;
+  | AttributesFormat
+  | QueryFormat;
 
 export interface LocationConfig {
   country?: string;
@@ -144,7 +152,7 @@ export interface ScrapeOptions {
   timeout?: number;
   waitFor?: number;
   mobile?: boolean;
-  parsers?: Array<string | { type: 'pdf'; maxPages?: number }>;
+  parsers?: Array<string | { type: 'pdf'; mode?: 'fast' | 'auto' | 'ocr'; maxPages?: number }>;
   actions?: ActionOption[];
   location?: LocationConfig;
   skipTlsVerification?: boolean;
@@ -152,10 +160,16 @@ export interface ScrapeOptions {
   fastMode?: boolean;
   useMock?: string;
   blockAds?: boolean;
-  proxy?: 'basic' | 'stealth' | 'auto' | string;
+  proxy?: 'basic' | 'stealth' | 'enhanced' | 'auto' | string;
   maxAge?: number;
+  minAge?: number;
   storeInCache?: boolean;
+  profile?: {
+    name: string;
+    saveChanges?: boolean;
+  };
   integration?: string;
+  origin?: string;
 }
 
 export interface WebhookConfig {
@@ -163,6 +177,151 @@ export interface WebhookConfig {
   headers?: Record<string, string>;
   metadata?: Record<string, string>;
   events?: Array<'completed' | 'failed' | 'page' | 'started'>;
+}
+
+// Agent webhook events differ from crawl: has 'action' and 'cancelled', no 'page'
+export type AgentWebhookEvent = 'started' | 'action' | 'completed' | 'failed' | 'cancelled';
+
+export interface AgentWebhookConfig {
+  url: string;
+  headers?: Record<string, string>;
+  metadata?: Record<string, string>;
+  events?: AgentWebhookEvent[];
+}
+
+export interface BrandingProfile {
+  colorScheme?: 'light' | 'dark';
+  logo?: string | null;
+  fonts?: Array<{
+    family: string;
+    [key: string]: unknown;
+  }>;
+  colors?: {
+    primary?: string;
+    secondary?: string;
+    accent?: string;
+    background?: string;
+    textPrimary?: string;
+    textSecondary?: string;
+    link?: string;
+    success?: string;
+    warning?: string;
+    error?: string;
+    [key: string]: string | undefined;
+  };
+  typography?: {
+    fontFamilies?: {
+      primary?: string;
+      heading?: string;
+      code?: string;
+      [key: string]: string | undefined;
+    };
+    fontStacks?: {
+      primary?: string[];
+      heading?: string[];
+      body?: string[];
+      paragraph?: string[];
+      [key: string]: string[] | undefined;
+    };
+    fontSizes?: {
+      h1?: string;
+      h2?: string;
+      h3?: string;
+      body?: string;
+      small?: string;
+      [key: string]: string | undefined;
+    };
+    lineHeights?: {
+      heading?: number;
+      body?: number;
+      [key: string]: number | undefined;
+    };
+    fontWeights?: {
+      light?: number;
+      regular?: number;
+      medium?: number;
+      bold?: number;
+      [key: string]: number | undefined;
+    };
+  };
+  spacing?: {
+    baseUnit?: number;
+    padding?: Record<string, number>;
+    margins?: Record<string, number>;
+    gridGutter?: number;
+    borderRadius?: string;
+    [key: string]: number | string | Record<string, number> | undefined;
+  };
+  components?: {
+    buttonPrimary?: {
+      background?: string;
+      textColor?: string;
+      borderColor?: string;
+      borderRadius?: string;
+      [key: string]: string | undefined;
+    };
+    buttonSecondary?: {
+      background?: string;
+      textColor?: string;
+      borderColor?: string;
+      borderRadius?: string;
+      [key: string]: string | undefined;
+    };
+    input?: {
+      borderColor?: string;
+      focusBorderColor?: string;
+      borderRadius?: string;
+      [key: string]: string | undefined;
+    };
+    [key: string]: unknown;
+  };
+  icons?: {
+    style?: string;
+    primaryColor?: string;
+    [key: string]: string | undefined;
+  };
+  images?: {
+    logo?: string | null;
+    favicon?: string | null;
+    ogImage?: string | null;
+    [key: string]: string | null | undefined;
+  };
+  animations?: {
+    transitionDuration?: string;
+    easing?: string;
+    [key: string]: string | undefined;
+  };
+  layout?: {
+    grid?: {
+      columns?: number;
+      maxWidth?: string;
+      [key: string]: number | string | undefined;
+    };
+    headerHeight?: string;
+    footerHeight?: string;
+    [key: string]:
+      | number
+      | string
+      | Record<string, number | string | undefined>
+      | undefined;
+  };
+  tone?: {
+    voice?: string;
+    emojiUsage?: string;
+    [key: string]: string | undefined;
+  };
+  personality?: {
+    tone:
+      | 'professional'
+      | 'playful'
+      | 'modern'
+      | 'traditional'
+      | 'minimalist'
+      | 'bold';
+    energy: 'low' | 'medium' | 'high';
+    targetAudience: string;
+  };
+  [key: string]: unknown;
 }
 
 export interface DocumentMetadata {
@@ -210,10 +369,13 @@ export interface DocumentMetadata {
   scrapeId?: string;
   numPages?: number;
   contentType?: string;
+  timezone?: string;
   proxyUsed?: 'basic' | 'stealth';
   cacheState?: 'hit' | 'miss';
   cachedAt?: string;
   creditsUsed?: number;
+  concurrencyLimited?: boolean;
+  concurrencyQueueDurationMs?: number;
 
   // Error information
   error?: string;
@@ -231,14 +393,17 @@ export interface Document {
   links?: string[];
   images?: string[];
   screenshot?: string;
+  audio?: string;
   attributes?: Array<{
     selector: string;
     attribute: string;
     values: string[];
   }>;
   actions?: Record<string, unknown>;
+  answer?: string;
   warning?: string;
   changeTracking?: Record<string, unknown>;
+  branding?: BrandingProfile;
 }
 
 // Pagination configuration for auto-fetching pages from v2 endpoints that return a `next` URL
@@ -286,7 +451,7 @@ export interface SearchData {
 }
 
 export interface CategoryOption {
-  type: 'github' | 'research';
+  type: 'github' | 'research' | 'pdf';
 }
 
 export interface SearchRequest {
@@ -294,7 +459,7 @@ export interface SearchRequest {
   sources?: Array<
     'web' | 'news' | 'images' | { type: 'web' | 'news' | 'images' }
   >;
-  categories?: Array<'github' | 'research' | CategoryOption>;
+  categories?: Array<'github' | 'research' | 'pdf' | CategoryOption>;
   limit?: number;
   tbs?: string;
   location?: string;
@@ -302,6 +467,7 @@ export interface SearchRequest {
   timeout?: number; // ms
   scrapeOptions?: ScrapeOptions;
   integration?: string;
+  origin?: string;
 }
 
 export interface CrawlOptions {
@@ -309,8 +475,9 @@ export interface CrawlOptions {
   excludePaths?: string[] | null;
   includePaths?: string[] | null;
   maxDiscoveryDepth?: number | null;
-  sitemap?: 'skip' | 'include';
+  sitemap?: 'skip' | 'include' | 'only';
   ignoreQueryParameters?: boolean;
+  deduplicateSimilarURLs?: boolean;
   limit?: number | null;
   crawlEntireDomain?: boolean;
   allowExternalLinks?: boolean;
@@ -319,8 +486,10 @@ export interface CrawlOptions {
   maxConcurrency?: number | null;
   webhook?: string | WebhookConfig | null;
   scrapeOptions?: ScrapeOptions | null;
+  regexOnFullURL?: boolean;
   zeroDataRetention?: boolean;
   integration?: string;
+  origin?: string;
 }
 
 export interface CrawlResponse {
@@ -329,6 +498,7 @@ export interface CrawlResponse {
 }
 
 export interface CrawlJob {
+  id: string;
   status: 'scraping' | 'completed' | 'failed' | 'cancelled';
   total: number;
   completed: number;
@@ -347,6 +517,7 @@ export interface BatchScrapeOptions {
   zeroDataRetention?: boolean;
   idempotencyKey?: string;
   integration?: string;
+  origin?: string;
 }
 
 export interface BatchScrapeResponse {
@@ -356,6 +527,7 @@ export interface BatchScrapeResponse {
 }
 
 export interface BatchScrapeJob {
+  id: string;
   status: 'scraping' | 'completed' | 'failed' | 'cancelled';
   completed: number;
   total: number;
@@ -373,9 +545,11 @@ export interface MapOptions {
   search?: string;
   sitemap?: 'only' | 'include' | 'skip';
   includeSubdomains?: boolean;
+  ignoreQueryParameters?: boolean;
   limit?: number;
   timeout?: number;
   integration?: string;
+  origin?: string;
   location?: LocationConfig;
 }
 
@@ -388,10 +562,27 @@ export interface ExtractResponse {
   warning?: string;
   sources?: Record<string, unknown>;
   expiresAt?: string;
+  creditsUsed?: number;
+}
+
+export interface AgentResponse {
+  success: boolean;
+  id: string;
+  error?: string;
+}
+
+export interface AgentStatusResponse {
+  success: boolean;
+  status: 'processing' | 'completed' | 'failed';
+  error?: string;
+  data?: unknown;
+  model?: 'spark-1-pro' | 'spark-1-mini';
+  expiresAt: string;
+  creditsUsed?: number;
 }
 
 export interface AgentOptions {
-  model: 'FIRE-1';
+  model: 'FIRE-1' | 'v3-beta';
 }
 
 export interface ConcurrencyCheck {
@@ -471,17 +662,36 @@ export class SdkError extends Error {
   status?: number;
   code?: string;
   details?: unknown;
+  jobId?: string;
   constructor(
     message: string,
     status?: number,
     code?: string,
-    details?: unknown
+    details?: unknown,
+    jobId?: string
   ) {
     super(message);
     this.name = 'FirecrawlSdkError';
     this.status = status;
     this.code = code;
     this.details = details;
+    this.jobId = jobId;
+  }
+}
+
+export class JobTimeoutError extends SdkError {
+  timeoutSeconds: number;
+  constructor(jobId: string, timeoutSeconds: number, jobType: 'batch' | 'crawl' = 'batch') {
+    const jobTypeLabel = jobType === 'batch' ? 'batch scrape' : 'crawl';
+    super(
+      `${jobTypeLabel.charAt(0).toUpperCase() + jobTypeLabel.slice(1)} job ${jobId} did not complete within ${timeoutSeconds} seconds`,
+      undefined,
+      'JOB_TIMEOUT',
+      undefined,
+      jobId
+    );
+    this.name = 'JobTimeoutError';
+    this.timeoutSeconds = timeoutSeconds;
   }
 }
 
@@ -492,4 +702,63 @@ export interface QueueStatusResponse {
   waitingJobsInQueue: number;
   maxConcurrency: number;
   mostRecentSuccess: string | null;
+}
+
+// Browser types
+export interface BrowserCreateResponse {
+  success: boolean;
+  id?: string;
+  cdpUrl?: string;
+  liveViewUrl?: string;
+  interactiveLiveViewUrl?: string;
+  expiresAt?: string;
+  error?: string;
+}
+
+export interface BrowserExecuteResponse {
+  success: boolean;
+  liveViewUrl?: string;
+  interactiveLiveViewUrl?: string;
+  output?: string;
+  stdout?: string;
+  result?: string;
+  stderr?: string;
+  exitCode?: number;
+  killed?: boolean;
+  error?: string;
+}
+
+export interface BrowserDeleteResponse {
+  success: boolean;
+  sessionDurationMs?: number;
+  creditsBilled?: number;
+  error?: string;
+}
+
+export interface ScrapeExecuteRequest {
+  code?: string;
+  prompt?: string;
+  language?: "python" | "node" | "bash";
+  timeout?: number;
+  origin?: string;
+}
+
+export type ScrapeExecuteResponse = BrowserExecuteResponse;
+export type ScrapeBrowserDeleteResponse = BrowserDeleteResponse;
+
+export interface BrowserSession {
+  id: string;
+  status: string;
+  cdpUrl: string;
+  liveViewUrl: string;
+  interactiveLiveViewUrl?: string;
+  streamWebView: boolean;
+  createdAt: string;
+  lastActivity: string;
+}
+
+export interface BrowserListResponse {
+  success: boolean;
+  sessions?: BrowserSession[];
+  error?: string;
 }

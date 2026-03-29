@@ -2,7 +2,7 @@ import { ExtractorOptions, PageOptions } from "./../../lib/entities";
 import { Request, Response } from "express";
 import { checkTeamCredits } from "../../services/billing/credit_billing";
 import { authenticateUser } from "../auth";
-import { RateLimiterMode } from "../../types";
+import { RateLimiterMode, AuthResponse } from "../../types";
 import { TeamFlags, toLegacyDocument, url as urlSchema } from "../v1/types";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist"; // Import the isUrlBlocked function
 import {
@@ -13,17 +13,19 @@ import {
 } from "../../lib/default-values";
 import { addScrapeJob, waitForJob } from "../../services/queue-jobs";
 import { redisEvictConnection } from "../../../src/services/redis";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { logger } from "../../lib/logger";
 import * as Sentry from "@sentry/node";
 import { getJobPriority } from "../../lib/job-priority";
 import { ZodError } from "zod";
 import { Document as V0Document } from "./../../lib/entities";
-import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
+import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { fromV0Combo } from "../v2/types";
 import { ScrapeJobTimeoutError } from "../../lib/error";
 import { scrapeQueue } from "../../services/worker/nuq";
 import { getErrorContactMessage } from "../../lib/deployment";
+import { logRequest } from "../../services/logging/log_job";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 async function scrapeHelper(
   jobId: string,
@@ -41,7 +43,21 @@ async function scrapeHelper(
   data?: V0Document | { url: string };
   returnCode: number;
 }> {
-  const url = urlSchema.parse(req.body.url);
+  let url: string;
+  try {
+    url = urlSchema.parse(req.body.url);
+  } catch (error) {
+    if (error instanceof ZodError) {
+      const errorMessage =
+        error.issues
+          .map(issue => issue.message)
+          .filter((msg, idx, arr) => arr.indexOf(msg) === idx)
+          .join("; ") || "Invalid URL";
+
+      return { success: false, error: errorMessage, returnCode: 400 };
+    }
+    throw error;
+  }
   if (typeof url !== "string") {
     return { success: false, error: "Url is required", returnCode: 400 };
   }
@@ -49,7 +65,7 @@ async function scrapeHelper(
   if (isUrlBlocked(url, flags)) {
     return {
       success: false,
-      error: BLOCKLISTED_URL_MESSAGE,
+      error: UNSUPPORTED_SITE_MESSAGE,
       returnCode: 403,
     };
   }
@@ -76,6 +92,7 @@ async function scrapeHelper(
       internalOptions,
       origin: req.body.origin ?? defaultOrigin,
       integration: req.body.integration,
+      billing: { endpoint: "scrape", jobId },
       startTime: Date.now(),
       zeroDataRetention: false, // not supported on v0
       apiKeyId,
@@ -169,14 +186,26 @@ export async function scrapeController(req: Request, res: Response) {
 
     const { team_id, chunk } = auth;
 
-    if (chunk?.flags?.forceZDR) {
+    if (getScrapeZDR(chunk?.flags) === "forced") {
       return res.status(400).json({
         error:
           "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API.",
       });
     }
 
-    const jobId = uuidv4();
+    const jobId = uuidv7();
+
+    await logRequest({
+      id: jobId,
+      kind: "scrape",
+      api_version: "v0",
+      team_id,
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      target_hint: req.body.url ?? "",
+      zeroDataRetention: false, // not supported on v0
+      api_key_id: chunk?.api_key_id ?? null,
+    });
 
     redisEvictConnection.sadd("teams_using_v0", team_id).catch(error =>
       logger.error("Failed to add team to teams_using_v0", {

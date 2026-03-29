@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { config } from "../../../../config";
 import { Document } from "../../../../controllers/v1/types";
 import { EngineScrapeResult } from "..";
 import { Meta } from "../..";
@@ -13,10 +14,22 @@ import {
   generateDomainSplits,
   addOMCEJob,
 } from "../../../../services";
-import { EngineError, IndexMissError } from "../../error";
+import {
+  AgentIndexOnlyError,
+  EngineError,
+  IndexMissError,
+  NoCachedDataError,
+} from "../../error";
 import { shouldParsePDF } from "../../../../controllers/v2/types";
+import { hasFormatOfType } from "../../../../lib/format-utils";
 
 export async function sendDocumentToIndex(meta: Meta, document: Document) {
+  // Skip caching if screenshot format has custom viewport or quality settings
+  const screenshotFormat = hasFormatOfType(meta.options.formats, "screenshot");
+  const hasCustomScreenshotSettings =
+    screenshotFormat?.viewport !== undefined ||
+    screenshotFormat?.quality !== undefined;
+
   const shouldCache =
     meta.options.storeInCache &&
     !meta.internalOptions.zeroDataRetention &&
@@ -38,12 +51,19 @@ export async function sendDocumentToIndex(meta: Meta, document: Document) {
         meta.winnerEngine !== "fire-engine;tlsclient;stealth" &&
         meta.winnerEngine !== "fetch")) &&
     !meta.featureFlags.has("actions") &&
+    !hasCustomScreenshotSettings &&
     (meta.options.headers === undefined ||
-      Object.keys(meta.options.headers).length === 0);
+      Object.keys(meta.options.headers).length === 0) &&
+    meta.options.profile === undefined;
 
   if (!shouldCache) {
     return document;
   }
+
+  // Generate indexId synchronously and set it on document immediately
+  // so it's available to other transformers (e.g., search index)
+  const indexId = crypto.randomUUID();
+  document.metadata.indexId = indexId;
 
   (async () => {
     try {
@@ -59,8 +79,6 @@ export async function sendDocumentToIndex(meta: Meta, document: Document) {
       const fakeDomain = meta.options.__experimental_omceDomain;
       const domainSplits = generateDomainSplits(hostname, fakeDomain);
       const domainSplitsHash = domainSplits.map(split => hashURL(split));
-
-      const indexId = crypto.randomUUID();
 
       try {
         await saveIndexToGCS(indexId, {
@@ -138,6 +156,9 @@ export async function sendDocumentToIndex(meta: Meta, document: Document) {
           location_country: meta.options.location?.country ?? null,
           location_languages: meta.options.location?.languages ?? null,
           status: document.metadata.statusCode,
+          is_precrawl: meta.internalOptions.isPreCrawl === true,
+          is_stealth: meta.featureFlags.has("stealthProxy"),
+          wait_time_ms: meta.options.waitFor > 0 ? meta.options.waitFor : null,
           ...urlSplitsHash.slice(0, 10).reduce(
             (a, x, i) => ({
               ...a,
@@ -203,8 +224,8 @@ export async function scrapeURLWithIndex(
 
     if (
       domainSplitsHash.length === 0 ||
-      process.env.FIRECRAWL_INDEX_WRITE_ONLY === "true" ||
-      process.env.USE_DB_AUTHENTICATION !== "true"
+      config.FIRECRAWL_INDEX_WRITE_ONLY ||
+      config.USE_DB_AUTHENTICATION !== true
     ) {
       maxAge = 2 * 24 * 60 * 60 * 1000; // 2 days
     } else {
@@ -244,21 +265,27 @@ export async function scrapeURLWithIndex(
 
   const checkpoint1 = Date.now();
 
-  const { data, error } = await index_supabase_service.rpc("index_get_recent", {
-    p_url_hash: urlHash,
-    p_max_age_ms: maxAge,
-    p_is_mobile: meta.options.mobile,
-    p_block_ads: meta.options.blockAds,
-    p_feature_screenshot: meta.featureFlags.has("screenshot"),
-    p_feature_screenshot_fullscreen: meta.featureFlags.has(
-      "screenshot@fullScreen",
-    ),
-    p_location_country: meta.options.location?.country ?? null,
-    p_location_languages:
-      (meta.options.location?.languages?.length ?? 0) > 0
-        ? meta.options.location?.languages
-        : null,
-  });
+  const { data, error } = await index_supabase_service.rpc(
+    "index_get_recent_4",
+    {
+      p_url_hash: urlHash,
+      p_max_age_ms: maxAge,
+      p_is_mobile: meta.options.mobile,
+      p_block_ads: meta.options.blockAds,
+      p_feature_screenshot: meta.featureFlags.has("screenshot"),
+      p_feature_screenshot_fullscreen: meta.featureFlags.has(
+        "screenshot@fullScreen",
+      ),
+      p_location_country: meta.options.location?.country ?? null,
+      p_location_languages:
+        (meta.options.location?.languages?.length ?? 0) > 0
+          ? meta.options.location?.languages
+          : null,
+      p_wait_time_ms: meta.options.waitFor,
+      p_is_stealth: meta.featureFlags.has("stealthProxy"),
+      p_min_age_ms: meta.options.minAge ?? null,
+    },
+  );
 
   if (error || !data) {
     throw new EngineError("Failed to retrieve URL from DB index", {
@@ -294,12 +321,22 @@ export async function scrapeURLWithIndex(
       timingsMaxAge: checkpoint1 - startTime,
       timingsSupa: Date.now() - checkpoint1,
     });
+
+    if (meta.internalOptions.agentIndexOnly) {
+      throw new AgentIndexOnlyError();
+    }
+
+    // when minAge is specified, don't waterfall to other engines
+    if (meta.options.minAge !== undefined) {
+      throw new NoCachedDataError();
+    }
+
     throw new IndexMissError();
   }
 
   const checkpoint2 = Date.now();
 
-  const id = data[0].id;
+  const id = selectedRow.id;
 
   const doc = await getIndexFromGCS(
     id + ".json",
@@ -361,7 +398,7 @@ export async function scrapeURLWithIndex(
     contentType: doc.contentType,
 
     cacheInfo: {
-      created_at: new Date(data[0].created_at),
+      created_at: new Date(selectedRow.created_at),
     },
 
     postprocessorsUsed: doc.postprocessorsUsed,

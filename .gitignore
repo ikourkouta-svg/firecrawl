@@ -47,3 +47,17 @@ CLAUDE.local.md
 *.egg-info/
 # local SDK venv
 apps/python-sdk/.venv/
+
+/apps/api/running-docs/
+
+
+/apps/go-html-to-md-service/.gomodcache/
+target/
+
+.cursor/
+
+# local files
+_local/
+
+
+apps/api/src/lib/scrape-interact/*.md

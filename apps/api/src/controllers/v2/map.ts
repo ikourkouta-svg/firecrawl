@@ -4,16 +4,18 @@ import {
   RequestWithAuth,
   MapRequest,
   MapResponse,
-  MAX_MAP_LIMIT,
 } from "./types";
 import { configDotenv } from "dotenv";
 import { billTeam } from "../../services/billing/credit_billing";
-import { logJob } from "../../services/logging/log_job";
+import { logMap, logRequest } from "../../services/logging/log_job";
 import { logger as _logger } from "../../lib/logger";
 import { MapTimeoutError } from "../../lib/error";
 import { checkPermissions } from "../../lib/permissions";
 import { getMapResults, MapResult } from "../../lib/map-utils";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
+import { isBaseDomain, extractBaseDomain } from "../../lib/url-utils";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { resolveViaAvgrab } from "../../lib/avgrab-resolve";
 
 configDotenv();
 
@@ -22,11 +24,11 @@ export async function mapController(
   res: Response<MapResponse>,
 ) {
   const logger = _logger.child({
-    jobId: uuidv4(),
+    jobId: uuidv7(),
     teamId: req.auth.team_id,
     module: "api/v2",
     method: "mapController",
-    zeroDataRetention: req.acuc?.flags?.forceZDR,
+    zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
   });
   // Get timing data from middleware (includes all middleware processing time)
   const middlewareStartTime =
@@ -46,13 +48,87 @@ export async function mapController(
 
   const middlewareTime = controllerStartTime - middlewareStartTime;
 
+  const mapId = uuidv7();
+
   logger.info("Map request", {
     request: req.body,
     originalRequest,
     teamId: req.auth.team_id,
+    mapId,
   });
 
+  await logRequest({
+    id: mapId,
+    kind: "map",
+    api_version: "v2",
+    team_id: req.auth.team_id,
+    origin: req.body.origin ?? "api",
+    integration: req.body.integration,
+    target_hint: req.body.url,
+    zeroDataRetention: false, // not supported for map
+    api_key_id: req.acuc?.api_key_id ?? null,
+  });
+
+  // Short-circuit: if the URL matches avgrab's resolve pattern, delegate entirely
+  try {
+    const avgrabResults = await resolveViaAvgrab(
+      req.body.url,
+      req.body.limit,
+      logger,
+    );
+
+    if (avgrabResults !== null) {
+      const creditsCost = avgrabResults.length;
+
+      billTeam(
+        req.auth.team_id,
+        req.acuc?.sub_id ?? undefined,
+        creditsCost,
+        req.acuc?.api_key_id ?? null,
+        { endpoint: "map", jobId: mapId },
+      ).catch(error => {
+        logger.error(
+          `Failed to bill team ${req.auth.team_id} for ${creditsCost} credits: ${error}`,
+        );
+      });
+
+      logMap({
+        id: mapId,
+        request_id: mapId,
+        url: req.body.url,
+        team_id: req.auth.team_id,
+        options: {
+          search: req.body.search,
+          sitemap: req.body.sitemap,
+          includeSubdomains: req.body.includeSubdomains,
+          ignoreQueryParameters: req.body.ignoreQueryParameters,
+          limit: req.body.limit,
+          timeout: req.body.timeout,
+          location: req.body.location,
+        },
+        results: avgrabResults,
+        credits_cost: creditsCost,
+        zeroDataRetention: false,
+      }).catch(error => {
+        logger.error(
+          `Failed to log job for team ${req.auth.team_id}: ${error}`,
+        );
+      });
+
+      return res.status(200).json({
+        success: true,
+        links: avgrabResults,
+      });
+    }
+  } catch (error) {
+    logger.warn("avgrab resolve failed, falling back to standard map", {
+      error,
+    });
+  }
+
   let result: MapResult;
+  let timeoutHandle: NodeJS.Timeout | null = null;
+
   const abort = new AbortController();
   try {
     result = (await Promise.race([
@@ -73,15 +149,19 @@ export async function mapController(
         filterByPath: req.body.filterByPath !== false,
         flags: req.acuc?.flags ?? null,
         useIndex: req.body.useIndex,
+        ignoreCache: req.body.ignoreCache,
         location: req.body.location,
+        headers: req.body.headers,
+        id: mapId,
       }),
       ...(req.body.timeout !== undefined
         ? [
-            new Promise((resolve, reject) =>
-              setTimeout(() => {
-                abort.abort(new MapTimeoutError());
-                reject(new MapTimeoutError());
-              }, req.body.timeout),
+            new Promise(
+              (_resolve, reject) =>
+                (timeoutHandle = setTimeout(() => {
+                  abort.abort(new MapTimeoutError());
+                  reject(new MapTimeoutError());
+                }, req.body.timeout)),
             ),
           ]
         : []),
@@ -96,6 +176,10 @@ export async function mapController(
     } else {
       throw error;
     }
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
   }
 
   // Bill the team
@@ -104,43 +188,32 @@ export async function mapController(
     req.acuc?.sub_id ?? undefined,
     1,
     req.acuc?.api_key_id ?? null,
+    { endpoint: "map", jobId: mapId },
   ).catch(error => {
     logger.error(
       `Failed to bill team ${req.auth.team_id} for 1 credit: ${error}`,
     );
   });
 
-  // Log the job
-  const mapCrawlerOptions = {
-    search: req.body.search,
-    sitemap: req.body.sitemap,
-    includeSubdomains: req.body.includeSubdomains,
-    ignoreQueryParameters: req.body.ignoreQueryParameters,
-    limit: req.body.limit,
-    timeout: req.body.timeout,
-  };
-
-  const mapScrapeOptions = {
-    location: req.body.location,
-  };
-
-  logJob({
-    job_id: result.job_id,
-    success: result.mapResults.length > 0,
-    message: "Map completed",
-    num_docs: result.mapResults.length,
-    docs: result.mapResults,
-    time_taken: result.time_taken,
-    team_id: req.auth.team_id,
-    mode: "map",
+  logMap({
+    id: result.job_id,
+    request_id: result.job_id,
     url: req.body.url,
-    crawlerOptions: mapCrawlerOptions,
-    scrapeOptions: mapScrapeOptions,
-    origin: req.body.origin ?? "api",
-    integration: req.body.integration,
-    num_tokens: 0,
-    credits_billed: 1,
+    team_id: req.auth.team_id,
+    options: {
+      search: req.body.search,
+      sitemap: req.body.sitemap,
+      includeSubdomains: req.body.includeSubdomains,
+      ignoreQueryParameters: req.body.ignoreQueryParameters,
+      limit: req.body.limit,
+      timeout: req.body.timeout,
+      location: req.body.location,
+    },
+    results: result.mapResults,
+    credits_cost: 1,
     zeroDataRetention: false, // not supported
+  }).catch(error => {
+    logger.error(`Failed to log job for team ${req.auth.team_id}: ${error}`);
   });
 
   // Log final timing information
@@ -159,9 +232,24 @@ export async function mapController(
     linksCount: result.mapResults.length,
   });
 
+  // Check if we should warn about base domain
+  let warning: string | undefined;
+  // Only show warning if results <= 1 AND user didn't explicitly request limit=1 AND URL is not base domain
+  if (
+    result.mapResults.length <= 1 &&
+    req.body.limit !== 1 &&
+    !isBaseDomain(req.body.url)
+  ) {
+    const baseDomain = extractBaseDomain(req.body.url);
+    if (baseDomain) {
+      warning = `Only ${result.mapResults.length} result(s) found. For broader coverage, try mapping the base domain: ${baseDomain}`;
+    }
+  }
+
   const response = {
     success: true as const,
     links: result.mapResults,
+    ...(warning && { warning }),
   };
 
   return res.status(200).json(response);

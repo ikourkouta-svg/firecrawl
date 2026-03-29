@@ -1,3 +1,4 @@
+import { v7 as uuidv7 } from "uuid";
 import { Response } from "express";
 import {
   RequestWithAuth,
@@ -5,11 +6,14 @@ import {
   extractRequestSchema,
   ExtractResponse,
 } from "./types";
-import { getExtractQueue } from "../../services/queue-service";
+import { addExtractJobToQueue } from "../../services/queue-service";
 import { saveExtract } from "../../lib/extract/extract-redis";
-import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
+import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { logger as _logger } from "../../lib/logger";
+import { logRequest } from "../../services/logging/log_job";
+import { config } from "../../config";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 /**
  * Extracts data from the provided URLs based on the request parameters.
@@ -25,11 +29,31 @@ export async function extractController(
   const originalRequest = { ...req.body };
   req.body = extractRequestSchema.parse(req.body);
 
-  if (req.acuc?.flags?.forceZDR) {
+  if (getScrapeZDR(req.acuc?.flags) === "forced") {
     return res.status(400).json({
       success: false,
       error:
         "Your team has zero data retention enabled. This is not supported on extract. Please contact support@firecrawl.com to unblock this feature.",
+    });
+  }
+
+  const extractId = uuidv7();
+  const createdAt = Date.now();
+  _logger.info("Extract starting...", {
+    request: req.body,
+    originalRequest,
+    teamId: req.auth.team_id,
+    team_id: req.auth.team_id,
+    subId: req.acuc?.sub_id,
+    extractId,
+    zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
+  });
+
+  if (req.body.agent?.model === "v3-beta") {
+    return res.status(400).json({
+      success: false,
+      error:
+        "Use the new /agent endpoint instead of passing agent.model=v3-beta into /extract.",
     });
   }
 
@@ -42,21 +66,21 @@ export async function extractController(
     if (!res.headersSent) {
       return res.status(403).json({
         success: false,
-        error: BLOCKLISTED_URL_MESSAGE,
+        error: UNSUPPORTED_SITE_MESSAGE,
       });
     }
   }
 
-  const extractId = crypto.randomUUID();
-  const createdAt = Date.now();
-  _logger.info("Extract starting...", {
-    request: req.body,
-    originalRequest,
-    teamId: req.auth.team_id,
+  await logRequest({
+    id: extractId,
+    kind: "extract",
+    api_version: "v2",
     team_id: req.auth.team_id,
-    subId: req.acuc?.sub_id,
-    extractId,
-    zeroDataRetention: req.acuc?.flags?.forceZDR,
+    origin: req.body.origin ?? "api",
+    integration: req.body.integration,
+    target_hint: req.body.urls?.[0] ?? "",
+    zeroDataRetention: false, // not supported for extract
+    api_key_id: req.acuc?.api_key_id ?? null,
   });
 
   const jobData = {
@@ -77,11 +101,12 @@ export async function extractController(
     showLLMUsage: req.body.__experimental_llmUsage,
     showSources: req.body.__experimental_showSources || req.body.showSources,
     showCostTracking: req.body.__experimental_showCostTracking,
-    zeroDataRetention: req.acuc?.flags?.forceZDR,
+    zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
   });
 
-  await getExtractQueue().add(extractId, jobData, {
-    jobId: extractId,
+  await addExtractJobToQueue(extractId, {
+    ...jobData,
+    apiKeyId: req.acuc?.api_key_id ?? undefined,
   });
 
   return res.status(200).json({

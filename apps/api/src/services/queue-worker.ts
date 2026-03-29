@@ -1,6 +1,7 @@
 import "dotenv/config";
-import { shutdownOtel } from "../otel";
+import { config } from "../config";
 import "./sentry";
+import { setSentryServiceTag } from "./sentry";
 import * as Sentry from "@sentry/node";
 import {
   getDeepResearchQueue,
@@ -10,7 +11,7 @@ import {
 import { Job, Queue, Worker } from "bullmq";
 import { logger as _logger } from "../lib/logger";
 import systemMonitor from "./system-monitor";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { configDotenv } from "dotenv";
 import { updateDeepResearch } from "../lib/deep-research/deep-research-redis";
 import { performDeepResearch } from "../lib/deep-research/deep-research-service";
@@ -18,23 +19,23 @@ import { performGenerateLlmsTxt } from "../lib/generate-llmstxt/generate-llmstxt
 import { updateGeneratedLlmsTxt } from "../lib/generate-llmstxt/generate-llmstxt-redis";
 import Express from "express";
 import { robustFetch } from "../scraper/scrapeURL/lib/fetch";
-import { BullMQOtel } from "bullmq-otel";
 import { initializeBlocklist } from "../scraper/WebScraper/utils/blocklist";
+import { initializeEngineForcing } from "../scraper/WebScraper/utils/engine-forcing";
+import { crawlFinishedQueue, NuQJob, scrapeQueue } from "./worker/nuq";
+import { finishCrawlSuper } from "./worker/crawl-logic";
+import { getCrawl } from "../lib/crawl-redis";
+import { TransportableError } from "../lib/error";
 
 configDotenv();
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-const jobLockExtendInterval =
-  Number(process.env.JOB_LOCK_EXTEND_INTERVAL) || 10000;
-const jobLockExtensionTime =
-  Number(process.env.JOB_LOCK_EXTENSION_TIME) || 60000;
+const jobLockExtendInterval = config.JOB_LOCK_EXTEND_INTERVAL;
+const jobLockExtensionTime = config.JOB_LOCK_EXTENSION_TIME;
 
-const cantAcceptConnectionInterval =
-  Number(process.env.CANT_ACCEPT_CONNECTION_INTERVAL) || 2000;
-const connectionMonitorInterval =
-  Number(process.env.CONNECTION_MONITOR_INTERVAL) || 10;
-const gotJobInterval = Number(process.env.CONNECTION_MONITOR_INTERVAL) || 20;
+const cantAcceptConnectionInterval = config.CANT_ACCEPT_CONNECTION_INTERVAL;
+const connectionMonitorInterval = config.CONNECTION_MONITOR_INTERVAL;
+const gotJobInterval = config.CONNECTION_MONITOR_INTERVAL;
 
 const runningJobs: Set<string> = new Set();
 
@@ -93,11 +94,14 @@ const processDeepResearchJobInternal = async (
   } catch (error) {
     logger.error(`🚫 Job errored ${job.id} - ${error}`, { error });
 
-    Sentry.captureException(error, {
-      data: {
-        job: job.id,
-      },
-    });
+    // Filter out TransportableErrors (flow control)
+    if (!(error instanceof TransportableError)) {
+      Sentry.captureException(error, {
+        data: {
+          job: job.id,
+        },
+      });
+    }
 
     try {
       // Move job to failed state in Redis
@@ -168,11 +172,14 @@ const processGenerateLlmsTxtJobInternal = async (
   } catch (error) {
     logger.error(`🚫 Job errored ${job.id} - ${error}`, { error });
 
-    Sentry.captureException(error, {
-      data: {
-        job: job.id,
-      },
-    });
+    // Filter out TransportableErrors (flow control)
+    if (!(error instanceof TransportableError)) {
+      Sentry.captureException(error, {
+        data: {
+          job: job.id,
+        },
+      });
+    }
 
     try {
       await job.moveToFailed(error, token, false);
@@ -191,18 +198,50 @@ const processGenerateLlmsTxtJobInternal = async (
   }
 };
 
+async function processFinishCrawlJobInternal(_job: NuQJob) {
+  const job = await crawlFinishedQueue.getJob(_job.id);
+
+  if (!job) {
+    throw new Error("crawlFinish job disappeared");
+  }
+
+  if (!job.groupId) {
+    throw new Error("crawlFinish job with no groupId");
+  }
+
+  if (!job.ownerId) {
+    throw new Error("crawlFinish job with no ownerId");
+  }
+
+  const sc = await getCrawl(job.groupId);
+
+  if (!sc) {
+    throw new Error("crawlFinish job with sc expired");
+  }
+
+  const anyJob = await scrapeQueue.getGroupAnyJob(job.groupId, job.ownerId);
+
+  if (!anyJob) {
+    throw new Error("crawlFinish couldn't find anyJob");
+  }
+
+  await finishCrawlSuper(anyJob);
+}
+
 let isShuttingDown = false;
 let isWorkerStalled = false;
 
-process.on("SIGINT", () => {
-  console.log("Received SIGTERM. Shutting down gracefully...");
-  isShuttingDown = true;
-});
+if (require.main === module) {
+  process.on("SIGINT", () => {
+    _logger.debug("Received SIGINT. Shutting down gracefully...");
+    isShuttingDown = true;
+  });
 
-process.on("SIGTERM", () => {
-  console.log("Received SIGTERM. Shutting down gracefully...");
-  isShuttingDown = true;
-});
+  process.on("SIGTERM", () => {
+    _logger.debug("Received SIGTERM. Shutting down gracefully...");
+    isShuttingDown = true;
+  });
+}
 
 let cantAcceptConnectionCount = 0;
 
@@ -217,7 +256,6 @@ const workerFun = async (
     lockDuration: 60 * 1000, // 60 seconds
     stalledInterval: 60 * 1000, // 60 seconds
     maxStalledCount: 10, // 10 times
-    telemetry: new BullMQOtel("firecrawl-bullmq"),
   });
 
   worker.startStalledCheckTimer();
@@ -226,10 +264,10 @@ const workerFun = async (
 
   while (true) {
     if (isShuttingDown) {
-      console.log("No longer accepting new jobs. SIGINT");
+      _logger.info("No longer accepting new jobs. SIGINT");
       break;
     }
-    const token = uuidv4();
+    const token = uuidv7();
     const canAcceptConnection = await monitor.acceptConnection();
     if (!canAcceptConnection) {
       console.log("Can't accept connection due to RAM/CPU load");
@@ -275,6 +313,93 @@ const workerFun = async (
   }
 };
 
+const crawlFinishWorker = async () => {
+  const __logger = _logger.child({
+    module: "extract-worker",
+    method: "crawlFinishWorker",
+  });
+
+  let noJobTimeout = 1500;
+
+  while (!isShuttingDown) {
+    const job = await crawlFinishedQueue.getJobToProcess();
+
+    if (job === null) {
+      __logger.info("No jobs to process", { module: "nuq/metrics" });
+      await new Promise(resolve => setTimeout(resolve, noJobTimeout));
+      if (!config.NUQ_RABBITMQ_URL) {
+        noJobTimeout = Math.min(noJobTimeout * 2, 10000);
+      }
+      continue;
+    }
+
+    noJobTimeout = 500;
+
+    const logger = __logger.child({
+      zeroDataRetention: job.data?.zeroDataRetention ?? false,
+      crawlId: job.groupId,
+    });
+
+    logger.info("Acquired job");
+
+    const lockRenewInterval = setInterval(async () => {
+      logger.info("Renewing lock");
+      if (!(await crawlFinishedQueue.renewLock(job.id, job.lock!, logger))) {
+        logger.warn("Failed to renew lock");
+        clearInterval(lockRenewInterval);
+        return;
+      }
+      logger.info("Renewed lock");
+    }, 15000);
+
+    let processResult:
+      | {
+          ok: true;
+          data: Awaited<ReturnType<typeof processFinishCrawlJobInternal>>;
+        }
+      | { ok: false; error: any };
+
+    try {
+      processResult = {
+        ok: true,
+        data: await processFinishCrawlJobInternal(job),
+      };
+    } catch (error) {
+      processResult = { ok: false, error };
+    }
+
+    clearInterval(lockRenewInterval);
+
+    if (processResult.ok) {
+      if (
+        !(await crawlFinishedQueue.jobFinish(
+          job.id,
+          job.lock!,
+          processResult.data,
+          logger,
+        ))
+      ) {
+        logger.warn("Could not update job status");
+      }
+    } else {
+      if (
+        !(await crawlFinishedQueue.jobFail(
+          job.id,
+          job.lock!,
+          processResult.error instanceof Error
+            ? processResult.error.message
+            : typeof processResult.error === "string"
+              ? processResult.error
+              : JSON.stringify(processResult.error),
+          logger,
+        ))
+      ) {
+        logger.warn("Could not update job status");
+      }
+    }
+  }
+};
+
 // Start all workers
 const app = Express();
 
@@ -282,11 +407,11 @@ let currentLiveness: boolean = true;
 
 app.get("/liveness", (req, res) => {
   _logger.info("Liveness endpoint hit");
-  if (process.env.USE_DB_AUTHENTICATION === "true") {
+  if (config.USE_DB_AUTHENTICATION) {
     // networking check for Kubernetes environments
-    const host = process.env.FIRECRAWL_APP_HOST || "firecrawl-app-service";
-    const port = process.env.FIRECRAWL_APP_PORT || "3002";
-    const scheme = process.env.FIRECRAWL_APP_SCHEME || "http";
+    const host = config.FIRECRAWL_APP_HOST;
+    const port = config.FIRECRAWL_APP_PORT;
+    const scheme = config.FIRECRAWL_APP_SCHEME;
 
     robustFetch({
       url: `${scheme}://${host}:${port}`,
@@ -312,29 +437,33 @@ app.get("/liveness", (req, res) => {
   }
 });
 
-const workerPort = process.env.WORKER_PORT || process.env.PORT || 3005;
+const workerPort = config.WORKER_PORT || config.PORT;
 app.listen(workerPort, () => {
   _logger.info(`Liveness endpoint is running on port ${workerPort}`);
 });
 
 (async () => {
+  setSentryServiceTag("queue-worker");
+
   await initializeBlocklist().catch(e => {
     _logger.error("Failed to initialize blocklist", { error: e });
     process.exit(1);
   });
 
+  initializeEngineForcing();
+
   await Promise.all([
     workerFun(getDeepResearchQueue(), processDeepResearchJobInternal),
     workerFun(getGenerateLlmsTxtQueue(), processGenerateLlmsTxtJobInternal),
+    crawlFinishWorker(),
   ]);
 
-  console.log("All workers exited. Waiting for all jobs to finish...");
+  _logger.info("All workers exited. Waiting for all jobs to finish...");
 
   while (runningJobs.size > 0) {
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 
-  console.log("All jobs finished. Worker out!");
-  await shutdownOtel();
+  _logger.info("All jobs finished. Shutting down...");
   process.exit(0);
 })();

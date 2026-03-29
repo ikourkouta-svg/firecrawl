@@ -1,14 +1,22 @@
 import { logger } from "../../lib/logger";
+import { config } from "../../config";
 import { getRedisConnection } from "../queue-service";
 import { supabase_service } from "../supabase";
 import * as Sentry from "@sentry/node";
 import { withAuth } from "../../lib/withAuth";
 import { setCachedACUC, setCachedACUCTeam } from "../../controllers/auth";
+import { autumnService } from "../autumn/autumn.service";
+import {
+  resolveBillingMetadata,
+  toAutumnBillingProperties,
+  type BillingEndpoint,
+  type BillingMetadata,
+} from "./types";
 
 // Configuration constants
 const BATCH_KEY = "billing_batch";
 const BATCH_LOCK_KEY = "billing_batch_lock";
-const BATCH_SIZE = 1000; // Batch size for processing
+const BATCH_SIZE = 5000; // Batch size for processing
 const BATCH_TIMEOUT = 15000; // 15 seconds processing interval
 const LOCK_TIMEOUT = 30000; // 30 seconds lock timeout
 
@@ -17,9 +25,12 @@ interface BillingOperation {
   team_id: string;
   subscription_id: string | null;
   credits: number;
+  billing?: BillingMetadata;
+  endpoint?: BillingEndpoint;
   is_extract: boolean;
   timestamp: string;
   api_key_id: number | null;
+  autumnTrackInRequest: boolean;
 }
 
 // Grouped billing operations for batch processing
@@ -27,6 +38,7 @@ interface GroupedBillingOperation {
   team_id: string;
   subscription_id: string | null;
   total_credits: number;
+  billing: BillingMetadata;
   is_extract: boolean;
   api_key_id: number | null;
   operations: BillingOperation[];
@@ -51,7 +63,45 @@ async function releaseLock() {
   logger.info("🔓 Released billing batch processing lock");
 }
 
-// Main function to process the billing batch
+async function refundRequestTrackedCredits(group: GroupedBillingOperation) {
+  const requestTrackedCredits = group.operations
+    .filter(op => op.autumnTrackInRequest)
+    .reduce((sum, op) => sum + op.credits, 0);
+
+  if (requestTrackedCredits <= 0) return;
+
+  try {
+    await autumnService.refundCredits({
+      teamId: group.team_id,
+      value: requestTrackedCredits,
+      properties: {
+        source: "processBillingBatch",
+        ...toAutumnBillingProperties(group.billing),
+        apiKeyId: group.api_key_id,
+        subscriptionId: group.subscription_id,
+      },
+    });
+  } catch (error) {
+    logger.warn("Failed to refund Autumn request-tracked credits", {
+      error,
+      team_id: group.team_id,
+      credits: requestTrackedCredits,
+      billing: group.billing,
+    });
+    Sentry.captureException(error, {
+      data: {
+        operation: "batch_billing_refund",
+        team_id: group.team_id,
+        credits: requestTrackedCredits,
+      },
+    });
+  }
+}
+
+/**
+ * Dequeues pending billing operations from Redis, groups them by team, and
+ * commits each group to Supabase via the `bill_team_6` RPC.
+ */
 export async function processBillingBatch() {
   const redis = getRedisConnection();
 
@@ -82,13 +132,19 @@ export async function processBillingBatch() {
     const groupedOperations = new Map<string, GroupedBillingOperation>();
 
     for (const op of operations) {
-      const key = `${op.team_id}:${op.subscription_id ?? "null"}:${op.is_extract}:${op.api_key_id}`;
+      const billing = resolveBillingMetadata({
+        billing:
+          op.billing ?? (op.endpoint ? { endpoint: op.endpoint } : undefined),
+        isExtract: op.is_extract,
+      });
+      const key = `${op.team_id}:${op.subscription_id ?? "null"}:${billing.endpoint}:${op.is_extract}:${op.api_key_id}`;
 
       if (!groupedOperations.has(key)) {
         groupedOperations.set(key, {
           team_id: op.team_id,
           subscription_id: op.subscription_id,
           total_credits: 0,
+          billing,
           is_extract: op.is_extract,
           api_key_id: op.api_key_id,
           operations: [],
@@ -101,13 +157,14 @@ export async function processBillingBatch() {
     }
 
     // Process each group of operations
-    for (const [key, group] of groupedOperations.entries()) {
+    for (const [, group] of groupedOperations.entries()) {
       logger.info(
         `🔄 Billing team ${group.team_id} for ${group.total_credits} credits`,
         {
           team_id: group.team_id,
           subscription_id: group.subscription_id,
           total_credits: group.total_credits,
+          billing: group.billing,
           operation_count: group.operations.length,
           is_extract: group.is_extract,
         },
@@ -119,9 +176,13 @@ export async function processBillingBatch() {
         continue;
       }
 
+      const batchTrackedCredits = group.operations
+        .filter(op => !op.autumnTrackInRequest)
+        .reduce((sum, op) => sum + op.credits, 0);
+
       try {
         // Execute the actual billing
-        await withAuth(supaBillTeam, {
+        const billingResult = await withAuth(supaBillTeam, {
           success: true,
           message: "No DB, bypassed.",
         })(
@@ -133,10 +194,38 @@ export async function processBillingBatch() {
           group.is_extract,
         );
 
+        if (!billingResult.success) {
+          await refundRequestTrackedCredits(group);
+          logger.warn(
+            `⚠️ Billing returned success: false for team ${group.team_id}`,
+            {
+              billingResult,
+              team_id: group.team_id,
+              credits: group.total_credits,
+            },
+          );
+          continue;
+        }
+
         logger.info(
-          `✅ Successfully billed team ${group.team_id} for ${group.total_credits} ${group.is_extract ? "tokens" : "credits"}`,
+          `✅ Successfully billed team ${group.team_id} for ${group.total_credits} credits`,
         );
+
+        if (batchTrackedCredits > 0) {
+          await autumnService.trackCredits({
+            teamId: group.team_id,
+            value: batchTrackedCredits,
+            properties: {
+              source: "processBillingBatch",
+              ...toAutumnBillingProperties(group.billing),
+              apiKeyId: group.api_key_id,
+              subscriptionId: group.subscription_id,
+            },
+          });
+        }
+
       } catch (error) {
+        await refundRequestTrackedCredits(group);
         logger.error(`❌ Failed to bill team ${group.team_id}`, {
           error,
           group,
@@ -181,13 +270,19 @@ export function startBillingBatchProcessing() {
   batchInterval.unref();
 }
 
-// Add a billing operation to the queue
+/**
+ * Enqueues a billing operation for async batch processing.
+ *
+ * Internal billing operations are batched and committed to Supabase.
+ */
 export async function queueBillingOperation(
   team_id: string,
   subscription_id: string | null | undefined,
   credits: number,
   api_key_id: number | null,
+  billing: BillingMetadata,
   is_extract: boolean = false,
+  autumnTrackInRequest: boolean = false,
 ) {
   // Skip queuing for preview teams
   if (team_id === "preview" || team_id.startsWith("preview_")) {
@@ -199,6 +294,7 @@ export async function queueBillingOperation(
     team_id,
     subscription_id,
     credits,
+    billing,
     is_extract,
   });
 
@@ -207,9 +303,11 @@ export async function queueBillingOperation(
       team_id,
       subscription_id: subscription_id ?? null,
       credits,
+      billing,
       is_extract,
       timestamp: new Date().toISOString(),
       api_key_id,
+      autumnTrackInRequest,
     };
 
     // Add operation to Redis list
@@ -241,7 +339,7 @@ export async function queueBillingOperation(
     // Should we add this?
     // I guess batch is fast enough that it's fine
 
-    // if (process.env.USE_DB_AUTHENTICATION === "true") {
+    // if (config.USE_DB_AUTHENTICATION) {
     //   (async () => {
     //     // Get API keys for this team to update in cache
     //     const { data } = await supabase_service
@@ -304,7 +402,7 @@ async function supaBillTeam(
   _logger.info(`Batch billing team ${team_id} for ${credits} credits`);
 
   // Perform the actual database operation
-  const { data, error } = await supabase_service.rpc("bill_team_5", {
+  const { data, error } = await supabase_service.rpc("bill_team_6", {
     _team_id: team_id,
     sub_id: subscription_id ?? null,
     fetch_subscription: subscription_id === undefined,
@@ -318,6 +416,14 @@ async function supaBillTeam(
     _logger.error("Failed to bill team.", { error });
     return { success: false, error };
   }
+
+  // Fire-and-forget — a Redis failure here must not trigger a false Autumn refund
+  // after bill_team_6 has already committed.
+  getRedisConnection()
+    .sadd("billed_teams", team_id)
+    .catch(err => {
+      _logger.warn("Failed to add team to billed_teams set", { err, team_id });
+    });
 
   // Update cached ACUC to reflect the new credit usage
   (async () => {

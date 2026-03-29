@@ -24,20 +24,29 @@ export function hasFormatOfType<T extends FormatObject["type"]>(
 }
 
 /**
- * Checks if any of the specified format types exist in the formats array.
- * Returns true if at least one of the types is found.
+ * Checks if a format of a specific type exists in a formats array.
+ * Works with both v1-style string arrays and v2-style object arrays.
  *
- * @param formats - Array of format objects
- * @param types - Array of format types to search for
- * @returns true if any of the types are found, false otherwise
+ * @param formats - Array of format strings or objects
+ * @param type - The format type to check for
+ * @returns true if the format exists, false otherwise
+ *
+ * @example
+ * // v2 style (object array)
+ * includesFormat([{ type: "markdown" }, { type: "html" }], "markdown") // true
+ *
+ * // v1 style (string array)
+ * includesFormat(["markdown", "html"], "markdown") // true
  */
-export function hasAnyFormatOfTypes(
-  formats: FormatObject[] | undefined,
-  types: FormatObject["type"][],
+export function includesFormat(
+  formats: (string | FormatObject)[] | undefined,
+  type: string,
 ): boolean {
   if (!formats) {
     return false;
   }
 
-  return formats.some(f => types.includes(f.type));
+  return formats.some(f =>
+    typeof f === "string" ? f === type : f.type === type,
+  );
 }

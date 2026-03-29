@@ -4,11 +4,13 @@ Async v2 client mirroring the regular client surface using true async HTTP trans
 
 import os
 import asyncio
+import time
 from typing import Optional, List, Dict, Any, Union, Callable, Literal
 from .types import (
     ScrapeOptions,
     CrawlRequest,
     WebhookConfig,
+    AgentWebhookConfig,
     SearchRequest,
     SearchData,
     SourceOption,
@@ -43,17 +45,42 @@ from .methods.aio import search as async_search  # type: ignore[attr-defined]
 from .methods.aio import map as async_map # type: ignore[attr-defined]
 from .methods.aio import usage as async_usage # type: ignore[attr-defined]
 from .methods.aio import extract as async_extract  # type: ignore[attr-defined]
+from .methods.aio import agent as async_agent  # type: ignore[attr-defined]
+from .methods.aio import browser as async_browser  # type: ignore[attr-defined]
 
 from .watcher_async import AsyncWatcher
 
 class AsyncFirecrawlClient:
-    def __init__(self, api_key: Optional[str] = None, api_url: str = "https://api.firecrawl.dev"):
+    @staticmethod
+    def _is_cloud_service(url: str) -> bool:
+        return "api.firecrawl.dev" in url.lower()
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        api_url: str = "https://api.firecrawl.dev",
+        timeout: Optional[float] = None,
+        max_retries: int = 3,
+        backoff_factor: float = 0.5,
+    ):
         if api_key is None:
             api_key = os.getenv("FIRECRAWL_API_KEY")
-        if not api_key:
-            raise ValueError("API key is required. Set FIRECRAWL_API_KEY or pass api_key.")
-        self.http_client = HttpClient(api_key, api_url)
-        self.async_http_client = AsyncHttpClient(api_key, api_url)
+        if self._is_cloud_service(api_url) and not api_key:
+            raise ValueError("API key is required for the cloud API. Set FIRECRAWL_API_KEY or pass api_key.")
+        self.http_client = HttpClient(
+            api_key,
+            api_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            backoff_factor=backoff_factor,
+        )
+        self.async_http_client = AsyncHttpClient(
+            api_key,
+            api_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            backoff_factor=backoff_factor,
+        )
 
     # Scrape
     async def scrape(
@@ -63,6 +90,60 @@ class AsyncFirecrawlClient:
     ):
         options = ScrapeOptions(**{k: v for k, v in kwargs.items() if v is not None}) if kwargs else None
         return await async_scrape.scrape(self.async_http_client, url, options)
+
+    async def interact(
+        self,
+        job_id: str,
+        code: Optional[str] = None,
+        *,
+        prompt: Optional[str] = None,
+        language: Literal["python", "node", "bash"] = "node",
+        timeout: Optional[int] = None,
+        origin: Optional[str] = None,
+    ):
+        return await async_scrape.interact(
+            self.async_http_client,
+            job_id,
+            code,
+            prompt=prompt,
+            language=language,
+            timeout=timeout,
+            origin=origin,
+        )
+
+    async def stop_interaction(self, job_id: str):
+        return await async_scrape.stop_interaction(
+            self.async_http_client,
+            job_id,
+        )
+
+    async def stop_interactive_browser(self, job_id: str):
+        """Deprecated alias for stop_interaction()."""
+        return await self.stop_interaction(job_id)
+
+    async def scrape_execute(
+        self,
+        job_id: str,
+        code: Optional[str] = None,
+        *,
+        prompt: Optional[str] = None,
+        language: Literal["python", "node", "bash"] = "node",
+        timeout: Optional[int] = None,
+        origin: Optional[str] = None,
+    ):
+        """Deprecated alias for interact()."""
+        return await self.interact(
+            job_id,
+            code,
+            prompt=prompt,
+            language=language,
+            timeout=timeout,
+            origin=origin,
+        )
+
+    async def delete_scrape_browser(self, job_id: str):
+        """Deprecated alias for stop_interaction()."""
+        return await self.stop_interaction(job_id)
 
     # Search
     async def search(
@@ -74,36 +155,123 @@ class AsyncFirecrawlClient:
         return await async_search.search(self.async_http_client, request)
 
     async def start_crawl(self, url: str, **kwargs) -> CrawlResponse:
+        sitemap = kwargs.pop("sitemap", None)
+        ignore_sitemap = kwargs.pop("ignore_sitemap", None)
+        if sitemap is None and ignore_sitemap is not None:
+            sitemap = "skip" if ignore_sitemap else "include"
+        if sitemap is not None:
+            kwargs["sitemap"] = sitemap
+
         request = CrawlRequest(url=url, **kwargs)
         return await async_crawl.start_crawl(self.async_http_client, request)
 
-    async def wait_crawl(self, job_id: str, poll_interval: int = 2, timeout: Optional[int] = None) -> CrawlJob:
-        # simple polling loop using blocking get (ok for test-level async)
-        start = asyncio.get_event_loop().time()
+    async def wait_crawl(
+        self,
+        job_id: str,
+        poll_interval: int = 2,
+        timeout: Optional[int] = None,
+        *,
+        request_timeout: Optional[float] = None,
+    ) -> CrawlJob:
+        """
+        Polls the status of a crawl job until it reaches a terminal state.
+
+        Args:
+            job_id (str): The ID of the crawl job to poll.
+            poll_interval (int, optional): Number of seconds to wait between polling attempts. Defaults to 2.
+            timeout (Optional[int], optional): Maximum number of seconds to wait for the entire crawl job to complete before timing out. If None, waits indefinitely. Defaults to None.
+            request_timeout (Optional[float], optional): Timeout (in seconds) for each individual HTTP request, including pagination requests when fetching results. If there are multiple pages, each page request gets this timeout. If None, no per-request timeout is set. Defaults to None.
+
+        Returns:
+            CrawlJob: The final status of the crawl job when it reaches a terminal state.
+
+        Raises:
+            TimeoutError: If the crawl does not reach a terminal state within the specified timeout.
+
+        Terminal states:
+            - "completed": The crawl finished successfully.
+            - "failed": The crawl finished with an error.
+            - "cancelled": The crawl was cancelled.
+        """
+        start = time.monotonic()
         while True:
-            status = await async_crawl.get_crawl_status(self.async_http_client, job_id)
-            if status.status in ["completed", "failed"]:
+            status = await async_crawl.get_crawl_status(
+                self.async_http_client,
+                job_id,
+                request_timeout=request_timeout,
+            )
+            if status.status in ["completed", "failed", "cancelled"]:
                 return status
-            if timeout and (asyncio.get_event_loop().time() - start) > timeout:
+            if timeout and (time.monotonic() - start) > timeout:
                 raise TimeoutError("Crawl wait timed out")
             await asyncio.sleep(poll_interval)
 
     async def crawl(self, **kwargs) -> CrawlJob:
         # wrapper combining start and wait
-        resp = await self.start_crawl(**{k: v for k, v in kwargs.items() if k not in ("poll_interval", "timeout")})
+        resp = await self.start_crawl(
+            **{k: v for k, v in kwargs.items() if k not in ("poll_interval", "timeout", "request_timeout")}
+        )
         poll_interval = kwargs.get("poll_interval", 2)
         timeout = kwargs.get("timeout")
-        return await self.wait_crawl(resp.id, poll_interval=poll_interval, timeout=timeout)
+        request_timeout = kwargs.get("request_timeout")
+        effective_request_timeout = request_timeout if request_timeout is not None else timeout
+        return await self.wait_crawl(
+            resp.id,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            request_timeout=effective_request_timeout,
+        )
 
     async def get_crawl_status(
-        self, 
+        self,
         job_id: str,
-        pagination_config: Optional[PaginationConfig] = None
+        pagination_config: Optional[PaginationConfig] = None,
+        *,
+        request_timeout: Optional[float] = None,
     ) -> CrawlJob:
+        """
+        Get the status of a crawl job.
+        
+        Args:
+            job_id: ID of the crawl job
+            pagination_config: Optional configuration for pagination behavior
+            request_timeout: Timeout (in seconds) for each individual HTTP request. When auto-pagination 
+                is enabled (default) and there are multiple pages of results, this timeout applies to 
+                each page request separately, not to the entire operation
+            
+        Returns:
+            CrawlJob with current status and data
+            
+        Raises:
+            Exception: If the status check fails
+        """
         return await async_crawl.get_crawl_status(
-            self.async_http_client, 
+            self.async_http_client,
             job_id,
-            pagination_config=pagination_config
+            pagination_config=pagination_config,
+            request_timeout=request_timeout,
+        )
+
+    async def get_crawl_status_page(
+        self,
+        next_url: str,
+        *,
+        request_timeout: Optional[float] = None,
+    ) -> CrawlJob:
+        """
+        Fetch a single page of crawl results using a next URL.
+
+        Args:
+            next_url: Opaque next URL from a prior crawl status response
+            request_timeout: Timeout (in seconds) for the HTTP request
+
+        Returns:
+            CrawlJob with the page data and next URL (if any)
+        """
+        return await async_crawl.get_crawl_status_page(
+            self.async_http_client,
+            next_url,
+            request_timeout=request_timeout,
         )
 
     async def cancel_crawl(self, job_id: str) -> bool:
@@ -176,6 +344,18 @@ class AsyncFirecrawlClient:
             pagination_config=pagination_config
         )
 
+    async def get_batch_scrape_status_page(
+        self,
+        next_url: str,
+        *,
+        request_timeout: Optional[float] = None,
+    ):
+        return await async_batch.get_batch_scrape_status_page(
+            self.async_http_client,
+            next_url,
+            request_timeout=request_timeout,
+        )
+
     async def cancel_batch_scrape(self, job_id: str) -> bool:
         return await async_batch.cancel_batch_scrape(self.async_http_client, job_id)
 
@@ -183,7 +363,7 @@ class AsyncFirecrawlClient:
         # Returns v2 errors structure; typed as CrawlErrorsResponse for parity
         return await async_batch.get_batch_scrape_errors(self.async_http_client, job_id)  # type: ignore[return-value]
 
-    # Extract (proxy to v1 async)
+    # Extract (proxy to v1 async) — deprecated
     async def extract(
         self,
         urls: Optional[List[str]] = None,
@@ -200,6 +380,13 @@ class AsyncFirecrawlClient:
         timeout: Optional[int] = None,
         integration: Optional[str] = None,
     ):
+        """Extract structured data and wait until completion (async).
+
+        .. deprecated::
+            The extract endpoint is in maintenance mode and its use is discouraged.
+            Review https://docs.firecrawl.dev/developer-guides/usage-guides/choosing-the-data-extractor
+            to find a replacement.
+        """
         return await async_extract.extract(
             self.async_http_client,
             urls,
@@ -217,6 +404,13 @@ class AsyncFirecrawlClient:
         )
 
     async def get_extract_status(self, job_id: str):
+        """Get the current status (and data if completed) of an extract job (async).
+
+        .. deprecated::
+            The extract endpoint is in maintenance mode and its use is discouraged.
+            Review https://docs.firecrawl.dev/developer-guides/usage-guides/choosing-the-data-extractor
+            to find a replacement.
+        """
         return await async_extract.get_extract_status(self.async_http_client, job_id)
 
     async def start_extract(
@@ -233,6 +427,13 @@ class AsyncFirecrawlClient:
         ignore_invalid_urls: Optional[bool] = None,
         integration: Optional[str] = None,
     ):
+        """Start an extract job (non-blocking, async).
+
+        .. deprecated::
+            The extract endpoint is in maintenance mode and its use is discouraged.
+            Review https://docs.firecrawl.dev/developer-guides/usage-guides/choosing-the-data-extractor
+            to find a replacement.
+        """
         return await async_extract.start_extract(
             self.async_http_client,
             urls,
@@ -245,6 +446,160 @@ class AsyncFirecrawlClient:
             scrape_options=scrape_options,
             ignore_invalid_urls=ignore_invalid_urls,
             integration=integration,
+        )
+
+    # Agent
+    async def agent(
+        self,
+        urls: Optional[List[str]] = None,
+        *,
+        prompt: str,
+        schema: Optional[Any] = None,
+        integration: Optional[str] = None,
+        poll_interval: int = 2,
+        timeout: Optional[int] = None,
+        max_credits: Optional[int] = None,
+        strict_constrain_to_urls: Optional[bool] = None,
+        model: Optional[Literal["spark-1-pro", "spark-1-mini"]] = None,
+        webhook: Optional[Union[str, AgentWebhookConfig]] = None,
+    ):
+        return await async_agent.agent(
+            self.async_http_client,
+            urls,
+            prompt=prompt,
+            schema=schema,
+            integration=integration,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            max_credits=max_credits,
+            strict_constrain_to_urls=strict_constrain_to_urls,
+            model=model,
+            webhook=webhook,
+        )
+
+    async def get_agent_status(self, job_id: str):
+        return await async_agent.get_agent_status(self.async_http_client, job_id)
+
+    async def start_agent(
+        self,
+        urls: Optional[List[str]] = None,
+        *,
+        prompt: str,
+        schema: Optional[Any] = None,
+        integration: Optional[str] = None,
+        max_credits: Optional[int] = None,
+        strict_constrain_to_urls: Optional[bool] = None,
+        model: Optional[Literal["spark-1-pro", "spark-1-mini"]] = None,
+        webhook: Optional[Union[str, AgentWebhookConfig]] = None,
+    ):
+        return await async_agent.start_agent(
+            self.async_http_client,
+            urls,
+            prompt=prompt,
+            schema=schema,
+            integration=integration,
+            max_credits=max_credits,
+            strict_constrain_to_urls=strict_constrain_to_urls,
+            model=model,
+            webhook=webhook,
+        )
+
+    async def cancel_agent(self, job_id: str) -> bool:
+        """Cancel a running agent job.
+
+        Args:
+            job_id: Agent job ID
+
+        Returns:
+            True if the agent was cancelled
+        """
+        return await async_agent.cancel_agent(self.async_http_client, job_id)
+
+    # Browser
+    async def browser(
+        self,
+        *,
+        ttl: Optional[int] = None,
+        activity_ttl: Optional[int] = None,
+        stream_web_view: Optional[bool] = None,
+        profile: Optional[Dict[str, Any]] = None,
+    ):
+        """Create a new browser session.
+
+        Args:
+            ttl: Total time-to-live in seconds (30-3600, default 300)
+            activity_ttl: Inactivity TTL in seconds (10-3600)
+            stream_web_view: Whether to enable webview streaming
+            profile: Profile config with ``name`` (str) and
+                optional ``save_changes`` (bool, default ``True``)
+
+        Returns:
+            BrowserCreateResponse with session id and CDP URL
+        """
+        return await async_browser.browser(
+            self.async_http_client,
+            ttl=ttl,
+            activity_ttl=activity_ttl,
+            stream_web_view=stream_web_view,
+            profile=profile,
+        )
+
+    async def browser_execute(
+        self,
+        session_id: str,
+        code: str,
+        *,
+        language: Literal["python", "node", "bash"] = "bash",
+        timeout: Optional[int] = None,
+    ):
+        """Execute code in a browser session.
+
+        Args:
+            session_id: Browser session ID
+            code: Code to execute
+            language: Programming language ("python", "node", or "bash")
+            timeout: Execution timeout in seconds (1-300, default 30)
+
+        Returns:
+            BrowserExecuteResponse with execution result
+        """
+        return await async_browser.browser_execute(
+            self.async_http_client,
+            session_id,
+            code,
+            language=language,
+            timeout=timeout,
+        )
+
+    async def delete_browser(self, session_id: str):
+        """Delete a browser session.
+
+        Args:
+            session_id: Browser session ID
+
+        Returns:
+            BrowserDeleteResponse
+        """
+        return await async_browser.delete_browser(
+            self.async_http_client, session_id
+        )
+
+    async def list_browsers(
+        self,
+        *,
+        status: Optional[Literal["active", "destroyed"]] = None,
+    ):
+        """List browser sessions.
+
+        Args:
+            status: Filter by session status ("active" or "destroyed")
+
+        Returns:
+            BrowserListResponse with list of sessions
+        """
+        return await async_browser.list_browsers(
+            self.async_http_client,
+            status=status,
         )
 
     # Usage endpoints
@@ -282,4 +637,3 @@ class AsyncFirecrawlClient:
         timeout: Optional[int] = None,
     ) -> AsyncWatcher:
         return AsyncWatcher(self, job_id, kind=kind, poll_interval=poll_interval, timeout=timeout)
-

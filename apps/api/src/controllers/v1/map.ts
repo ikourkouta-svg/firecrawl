@@ -1,5 +1,6 @@
 import { Response } from "express";
-import { v4 as uuidv4 } from "uuid";
+import { config } from "../../config";
+import { v7 as uuidv7 } from "uuid";
 import {
   MapDocument,
   mapRequestSchema,
@@ -18,7 +19,7 @@ import {
 } from "../../lib/validateUrl";
 import { fireEngineMap } from "../../search/fireEngine";
 import { billTeam } from "../../services/billing/credit_billing";
-import { logJob } from "../../services/logging/log_job";
+import { logMap, logRequest } from "../../services/logging/log_job";
 import { performCosineSimilarity } from "../../lib/map-cosine";
 import { logger } from "../../lib/logger";
 import Redis from "ioredis";
@@ -29,9 +30,10 @@ import {
 } from "../../services/index";
 import { MapTimeoutError } from "../../lib/error";
 import { checkPermissions } from "../../lib/permissions";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 configDotenv();
-const redis = new Redis(process.env.REDIS_URL!);
+const redis = new Redis(config.REDIS_URL!);
 
 // Max Links that "Smart /map" can return
 const MAX_FIRE_ENGINE_RESULTS = 500;
@@ -94,8 +96,11 @@ export async function getMapResults({
   filterByPath = true,
   flags,
   useIndex = true,
+  ignoreCache = false,
   timeout,
   location,
+  headers,
+  id: providedId,
 }: {
   url: string;
   search?: string;
@@ -112,14 +117,17 @@ export async function getMapResults({
   filterByPath?: boolean;
   flags: TeamFlags;
   useIndex?: boolean;
+  ignoreCache?: boolean;
   timeout?: number;
   location?: ScrapeOptions["location"];
+  headers?: Record<string, string>;
+  id?: string;
 }): Promise<MapResult> {
-  const id = uuidv4();
+  const id = providedId ?? uuidv7();
   let links: string[] = [url];
   let mapResults: MapDocument[] = [];
 
-  const zeroDataRetention = flags?.forceZDR ?? false;
+  const zeroDataRetention = getScrapeZDR(flags) === "forced" || false;
 
   const sc: StoredCrawl = {
     originUrl: url,
@@ -130,6 +138,7 @@ export async function getMapResults({
     },
     scrapeOptions: scrapeOptions.parse({
       ...(location ? { location } : {}),
+      ...(headers ? { headers } : {}),
     }),
     internalOptions: { teamId },
     team_id: teamId,
@@ -156,6 +165,7 @@ export async function getMapResults({
       timeout ?? 30000,
       abort,
       mock,
+      ignoreCache ? 0 : undefined,
     );
     if (sitemap > 0) {
       links = links
@@ -186,7 +196,7 @@ export async function getMapResults({
     );
 
     const cacheKey = `fireEngineMap:${mapUrl}`;
-    const cachedResult = await redis.get(cacheKey);
+    const cachedResult = ignoreCache ? null : await redis.get(cacheKey);
 
     let allResults: any[] = [];
     let pagePromises: Promise<any>[] = [];
@@ -242,6 +252,8 @@ export async function getMapResults({
           false,
           timeout ?? 30000,
           abort,
+          undefined,
+          ignoreCache ? 0 : undefined,
         );
       } catch (e) {
         logger.warn("tryGetSitemap threw an error", { error: e });
@@ -358,7 +370,7 @@ export async function mapController(
   const originalRequest = req.body;
   req.body = mapRequestSchema.parse(req.body);
 
-  if (req.acuc?.flags?.forceZDR) {
+  if (getScrapeZDR(req.acuc?.flags) === "forced") {
     return res.status(400).json({
       success: false,
       error:
@@ -376,13 +388,30 @@ export async function mapController(
 
   const middlewareTime = controllerStartTime - middlewareStartTime;
 
+  const mapId = uuidv7();
+
   logger.info("Map request", {
     request: req.body,
     originalRequest,
     teamId: req.auth.team_id,
+    mapId,
+  });
+
+  await logRequest({
+    id: mapId,
+    kind: "map",
+    api_version: "v1",
+    team_id: req.auth.team_id,
+    origin: req.body.origin ?? "api",
+    integration: req.body.integration,
+    target_hint: req.body.url,
+    zeroDataRetention: false, // not supported for map
+    api_key_id: req.acuc?.api_key_id ?? null,
   });
 
   let result: Awaited<ReturnType<typeof getMapResults>>;
+  let timeoutHandle: NodeJS.Timeout | null = null;
+
   const abort = new AbortController();
   try {
     result = (await Promise.race([
@@ -400,16 +429,20 @@ export async function mapController(
         filterByPath: req.body.filterByPath !== false,
         flags: req.acuc?.flags ?? null,
         useIndex: req.body.useIndex,
+        ignoreCache: req.body.ignoreCache,
         timeout: req.body.timeout,
         location: req.body.location,
+        headers: req.body.headers,
+        id: mapId,
       }),
       ...(req.body.timeout !== undefined
         ? [
-            new Promise((resolve, reject) =>
-              setTimeout(() => {
-                abort.abort(new MapTimeoutError());
-                reject(new MapTimeoutError());
-              }, req.body.timeout),
+            new Promise(
+              (_resolve, reject) =>
+                (timeoutHandle = setTimeout(() => {
+                  abort.abort(new MapTimeoutError());
+                  reject(new MapTimeoutError());
+                }, req.body.timeout)),
             ),
           ]
         : []),
@@ -424,6 +457,10 @@ export async function mapController(
     } else {
       throw error;
     }
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
   }
 
   // Bill the team
@@ -432,6 +469,7 @@ export async function mapController(
     req.acuc?.sub_id,
     1,
     req.acuc?.api_key_id ?? null,
+    { endpoint: "map", jobId: mapId },
   ).catch(error => {
     logger.error(
       `Failed to bill team ${req.auth.team_id} for 1 credit: ${error}`,
@@ -439,22 +477,23 @@ export async function mapController(
   });
 
   // Log the job
-  logJob({
-    job_id: result.job_id,
-    success: result.links.length > 0,
-    message: "Map completed",
-    num_docs: result.links.length,
-    docs: result.links,
-    time_taken: result.time_taken,
-    team_id: req.auth.team_id,
-    mode: "map",
+  logMap({
+    id: result.job_id,
+    request_id: result.job_id,
     url: req.body.url,
-    crawlerOptions: {},
-    scrapeOptions: {},
-    origin: req.body.origin ?? "api",
-    integration: req.body.integration,
-    num_tokens: 0,
-    credits_billed: 1,
+    team_id: req.auth.team_id,
+    options: {
+      search: req.body.search,
+      limit: req.body.limit,
+      ignoreSitemap: req.body.ignoreSitemap,
+      includeSubdomains: req.body.includeSubdomains,
+      filterByPath: req.body.filterByPath !== false,
+      useIndex: req.body.useIndex,
+      timeout: req.body.timeout,
+      location: req.body.location,
+    },
+    results: result.links,
+    credits_cost: 1,
     zeroDataRetention: false, // not supported
   });
 

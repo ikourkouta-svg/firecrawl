@@ -5,11 +5,11 @@ import {
 } from "../../services/billing/credit_billing";
 import { authenticateUser } from "../auth";
 import { RateLimiterMode, ScrapeJobSingleUrls } from "../../types";
-import { logJob } from "../../services/logging/log_job";
+import { logSearch, logRequest } from "../../services/logging/log_job";
 import { PageOptions, SearchOptions } from "../../lib/entities";
 import { search } from "../../search";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { logger } from "../../lib/logger";
 import { redisEvictConnection } from "../../../src/services/redis";
 import { addScrapeJob, waitForJob } from "../../services/queue-jobs";
@@ -24,6 +24,7 @@ import { fromV0Combo } from "../v2/types";
 import { ScrapeJobTimeoutError } from "../../lib/error";
 import { scrapeQueue } from "../../services/worker/nuq";
 import { defaultOrigin } from "../../lib/default-values";
+import { getSearchZDR } from "../../lib/zdr-helpers";
 
 async function searchHelper(
   jobId: string,
@@ -80,14 +81,19 @@ async function searchHelper(
   );
 
   if (justSearch) {
-    billTeam(team_id, subscription_id, res.length, api_key_id, logger).catch(
-      error => {
-        logger.error(
-          `Failed to bill team ${team_id} for ${res.length} credits: ${error}`,
-        );
-        // Optionally, you could notify an admin or add to a retry queue here
-      },
-    );
+    billTeam(
+      team_id,
+      subscription_id,
+      res.length,
+      api_key_id,
+      { endpoint: "search", jobId },
+      logger,
+    ).catch(error => {
+      logger.error(
+        `Failed to bill team ${team_id} for ${res.length} credits: ${error}`,
+      );
+      // Optionally, you could notify an admin or add to a retry queue here
+    });
     return { success: true, data: res, returnCode: 200 };
   }
 
@@ -101,12 +107,13 @@ async function searchHelper(
   }
 
   const jobPriority = await getJobPriority({ team_id, basePriority: 20 });
+  const billing = { endpoint: "search" as const, jobId };
 
   // filter out social media links
 
   const jobDatas = res.map(x => {
     const url = x.url;
-    const uuid = uuidv4();
+    const uuid = uuidv7();
     return {
       jobId: uuid,
       data: {
@@ -119,6 +126,8 @@ async function searchHelper(
         zeroDataRetention: false, // not supported on v0
         apiKeyId: api_key_id,
         origin: req.body.origin ?? defaultOrigin,
+        requestId: jobId,
+        billing,
       } satisfies ScrapeJobSingleUrls,
     };
   });
@@ -168,14 +177,26 @@ export async function searchController(req: Request, res: Response) {
     }
     const { team_id, chunk } = auth;
 
-    if (chunk?.flags?.forceZDR) {
+    if (getSearchZDR(chunk?.flags) === "forced") {
       return res.status(400).json({
         error:
           "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API.",
       });
     }
 
-    const jobId = uuidv4();
+    const jobId = uuidv7();
+
+    await logRequest({
+      id: jobId,
+      kind: "search",
+      api_version: "v0",
+      team_id,
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      target_hint: req.body.query ?? "",
+      zeroDataRetention: false, // not supported on v0
+      api_key_id: chunk?.api_key_id ?? null,
+    });
 
     redisEvictConnection.sadd("teams_using_v0", team_id).catch(error =>
       logger.error("Failed to add team to teams_using_v0", {
@@ -230,25 +251,20 @@ export async function searchController(req: Request, res: Response) {
     );
     const endTime = new Date().getTime();
     const timeTakenInSeconds = (endTime - startTime) / 1000;
-    logJob({
-      job_id: jobId,
-      success: result.success,
-      message: result.error,
-      num_docs: result.data ? result.data.length : 0,
-      docs: result.data,
+    await logSearch({
+      id: jobId,
+      request_id: jobId,
+      query: req.body.query,
+      num_results: result.data?.length ?? 0,
+      is_successful: result.success,
+      error: result.error,
+      results: result.data,
       time_taken: timeTakenInSeconds,
       team_id: team_id,
-      mode: "search",
-      url: req.body.query,
-      scrapeOptions: fromLegacyScrapeOptions(
-        req.body.pageOptions,
-        undefined,
-        60000,
-        team_id,
-      ),
-      crawlerOptions: crawlerOptions,
-      origin,
-      integration: req.body.integration,
+      options: searchOptions,
+      credits_cost: pageOptions.fetchPageContent
+        ? 0
+        : (result.data?.length ?? 0),
       zeroDataRetention: false, // not supported
     });
     return res.status(result.returnCode).json(result);

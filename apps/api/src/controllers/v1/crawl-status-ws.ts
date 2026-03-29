@@ -8,7 +8,7 @@ import {
   RequestWithAuth,
 } from "./types";
 import { WebSocket } from "ws";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { logger } from "../../lib/logger";
 import {
   getCrawl,
@@ -182,15 +182,15 @@ export async function crawlStatusWSController(
       });
     }
 
-    const { team_id } = auth;
+    const { team_id, org_id } = auth;
 
-    req.auth = { team_id };
+    req.auth = { team_id, org_id };
 
     await crawlStatusWS(ws, req);
   } catch (err) {
     Sentry.captureException(err);
 
-    const id = uuidv4();
+    const id = uuidv7();
     let verbose = JSON.stringify(err);
     if (verbose === "{}") {
       if (err instanceof Error) {

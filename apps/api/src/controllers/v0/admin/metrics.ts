@@ -1,12 +1,14 @@
 import type { Request, Response } from "express";
-import { redisEvictConnection } from "../../../services/redis";
+import { getRedisConnection } from "../../../services/queue-service";
 import { nuqGetLocalMetrics, scrapeQueue } from "../../../services/worker/nuq";
+import { teamConcurrencySemaphore } from "../../../services/worker/team-semaphore";
 
 export async function metricsController(_: Request, res: Response) {
   let cursor: string = "0";
-  const metrics: Record<string, number> = {};
+  let totalJobCount = 0;
+  let teamCount = 0;
   do {
-    const res = await redisEvictConnection.sscan(
+    const res = await getRedisConnection().sscan(
       "concurrency-limit-queues",
       cursor,
     );
@@ -15,29 +17,34 @@ export async function metricsController(_: Request, res: Response) {
     const keys = res[1];
 
     for (const key of keys) {
-      const jobCount = await redisEvictConnection.zcard(key);
+      const jobCount = await getRedisConnection().zcard(key);
 
       if (jobCount === 0) {
-        await redisEvictConnection.srem("concurrency-limit-queues", key);
+        await getRedisConnection().srem("concurrency-limit-queues", key);
       } else {
-        const teamId = key.split(":")[1];
-        metrics[teamId] = jobCount;
+        totalJobCount += jobCount;
+        teamCount++;
       }
     }
   } while (cursor !== "0");
 
+  const semaphoreMetrics = await teamConcurrencySemaphore.getMetrics();
+
   res.contentType("text/plain").send(`\
-# HELP concurrency_limit_queue_job_count The number of jobs in the concurrency limit queue per team
-# TYPE concurrency_limit_queue_job_count gauge
-${Object.entries(metrics)
-  .map(
-    ([key, value]) =>
-      `concurrency_limit_queue_job_count{team_id="${key}"} ${value}`,
-  )
-  .join("\n")}
+# HELP concurrency_limit_queue_job_count_total The total number of jobs across all concurrency limit queues
+# TYPE concurrency_limit_queue_job_count_total gauge
+concurrency_limit_queue_job_count_total ${totalJobCount}
+
+# HELP concurrency_limit_queue_team_count The number of teams with jobs in the concurrency limit queue
+# TYPE concurrency_limit_queue_team_count gauge
+concurrency_limit_queue_team_count ${teamCount}
+
+# HELP billed_teams_count The number of teams that have been billed but not yet tallied
+# TYPE billed_teams_count gauge
+billed_teams_count ${await getRedisConnection().scard("billed_teams")}
 
 ${nuqGetLocalMetrics()}
-`);
+${semaphoreMetrics}`);
 }
 
 export async function nuqMetricsController(_: Request, res: Response) {

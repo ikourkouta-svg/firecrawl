@@ -11,7 +11,7 @@ import {
   defaultCrawlerOptions,
   defaultOrigin,
 } from "../../../src/lib/default-values";
-import { v4 as uuidv4 } from "uuid";
+import { v7 as uuidv7 } from "uuid";
 import { logger } from "../../../src/lib/logger";
 import {
   addCrawlJob,
@@ -20,6 +20,7 @@ import {
   finishCrawlKickoff,
   lockURL,
   lockURLs,
+  markCrawlActive,
   saveCrawl,
   StoredCrawl,
 } from "../../../src/lib/crawl-redis";
@@ -29,9 +30,12 @@ import * as Sentry from "@sentry/node";
 import { getJobPriority } from "../../lib/job-priority";
 import { url as urlSchema } from "../v1/types";
 import { ZodError } from "zod";
-import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
+import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { fromV0ScrapeOptions } from "../v2/types";
 import { isSelfHosted } from "../../lib/deployment";
+import { crawlGroup } from "../../services/worker/nuq";
+import { logRequest } from "../../services/logging/log_job";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 export async function crawlController(req: Request, res: Response) {
   try {
@@ -42,14 +46,26 @@ export async function crawlController(req: Request, res: Response) {
 
     const { team_id, chunk } = auth;
 
-    if (chunk?.flags?.forceZDR) {
+    if (getScrapeZDR(chunk?.flags) === "forced") {
       return res.status(400).json({
         error:
           "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API.",
       });
     }
 
-    const id = uuidv4();
+    const id = uuidv7();
+
+    await logRequest({
+      id,
+      kind: "crawl",
+      api_version: "v0",
+      team_id,
+      origin: req.body.origin ?? "api",
+      integration: req.body.integration,
+      target_hint: req.body.url ?? "",
+      zeroDataRetention: false, // not supported on v0
+      api_key_id: chunk?.api_key_id ?? null,
+    });
 
     redisEvictConnection.sadd("teams_using_v0", team_id).catch(error =>
       logger.error("Failed to add team to teams_using_v0", {
@@ -141,7 +157,7 @@ export async function crawlController(req: Request, res: Response) {
 
     if (isUrlBlocked(url, auth.chunk?.flags ?? null)) {
       return res.status(403).json({
-        error: BLOCKLISTED_URL_MESSAGE,
+        error: UNSUPPORTED_SITE_MESSAGE,
       });
     }
 
@@ -149,7 +165,7 @@ export async function crawlController(req: Request, res: Response) {
     //   try {
     //     const a = new WebScraperDataProvider();
     //     await a.setOptions({
-    //       jobId: uuidv4(),
+    //       jobId: uuidv7(),
     //       mode: "single_urls",
     //       urls: [url],
     //       crawlerOptions: { ...crawlerOptions, returnOnlyUrls: true },
@@ -202,7 +218,15 @@ export async function crawlController(req: Request, res: Response) {
       sc.robots = await crawler.getRobotsTxt();
     } catch (_) {}
 
+    await crawlGroup.addGroup(
+      id,
+      sc.team_id,
+      (chunk?.flags?.crawlTtlHours ?? 24) * 60 * 60 * 1000,
+    );
+
     await saveCrawl(id, sc);
+
+    await markCrawlActive(id);
 
     await finishCrawlKickoff(id);
 
@@ -215,8 +239,9 @@ export async function crawlController(req: Request, res: Response) {
             team_id,
             basePriority: 21,
           });
+          const billing = { endpoint: "crawl" as const, jobId: id };
           const jobs = urls.map(url => {
-            const uuid = uuidv4();
+            const uuid = uuidv7();
             return {
               jobId: uuid,
               data: {
@@ -228,6 +253,7 @@ export async function crawlController(req: Request, res: Response) {
                 team_id,
                 origin: req.body.origin ?? defaultOrigin,
                 integration: req.body.integration,
+                billing,
                 crawl_id: id,
                 sitemapped: true,
                 zeroDataRetention: false, // not supported on v0
@@ -260,7 +286,7 @@ export async function crawlController(req: Request, res: Response) {
       // Not needed, first one should be 15.
       // const jobPriority = await getJobPriority({team_id, basePriority: 10})
 
-      const jobId = uuidv4();
+      const jobId = uuidv7();
       await addScrapeJob(
         {
           url,
@@ -271,6 +297,7 @@ export async function crawlController(req: Request, res: Response) {
           team_id,
           origin: req.body.origin ?? defaultOrigin,
           integration: req.body.integration,
+          billing: { endpoint: "crawl", jobId: id },
           crawl_id: id,
           zeroDataRetention: false, // not supported on v0
           apiKeyId: chunk?.api_key_id ?? null,

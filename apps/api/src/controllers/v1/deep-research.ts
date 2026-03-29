@@ -1,9 +1,12 @@
+import { v7 as uuidv7 } from "uuid";
 import { Request, Response } from "express";
 import { ErrorResponse, extractOptions, RequestWithAuth } from "./types";
 import { getDeepResearchQueue } from "../../services/queue-service";
 import * as Sentry from "@sentry/node";
 import { saveDeepResearch } from "../../lib/deep-research/deep-research-redis";
 import { z } from "zod";
+import { logRequest } from "../../services/logging/log_job";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 const deepResearchRequestSchema = z
   .object({
@@ -79,7 +82,7 @@ export async function deepResearchController(
   req: RequestWithAuth<{}, DeepResearchResponse, DeepResearchRequest>,
   res: Response<DeepResearchResponse>,
 ) {
-  if (req.acuc?.flags?.forceZDR) {
+  if (getScrapeZDR(req.acuc?.flags) === "forced") {
     return res.status(400).json({
       success: false,
       error:
@@ -89,7 +92,19 @@ export async function deepResearchController(
 
   req.body = deepResearchRequestSchema.parse(req.body);
 
-  const researchId = crypto.randomUUID();
+  const researchId = uuidv7();
+
+  await logRequest({
+    id: researchId,
+    kind: "deep_research",
+    api_version: "v1",
+    team_id: req.auth.team_id,
+    origin: "api",
+    target_hint: req.body.query ?? "",
+    zeroDataRetention: false, // not supported for deep research
+    api_key_id: req.acuc?.api_key_id ?? null,
+  });
+
   const jobData = {
     request: req.body,
     teamId: req.auth.team_id,

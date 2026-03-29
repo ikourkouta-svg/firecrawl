@@ -1,5 +1,6 @@
 import { Response } from "express";
-import { v4 as uuidv4 } from "uuid";
+import { config } from "../../config";
+import { v7 as uuidv7 } from "uuid";
 import {
   CrawlRequest,
   crawlRequestSchema,
@@ -7,11 +8,19 @@ import {
   RequestWithAuth,
   toLegacyCrawlerOptions,
 } from "./types";
-import { crawlToCrawler, saveCrawl, StoredCrawl } from "../../lib/crawl-redis";
+import {
+  crawlToCrawler,
+  saveCrawl,
+  StoredCrawl,
+  markCrawlActive,
+} from "../../lib/crawl-redis";
 import { _addScrapeJobToBullMQ } from "../../services/queue-jobs";
 import { logger as _logger } from "../../lib/logger";
 import { fromV1ScrapeOptions } from "../v2/types";
 import { checkPermissions } from "../../lib/permissions";
+import { crawlGroup } from "../../services/worker/nuq";
+import { logRequest } from "../../services/logging/log_job";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 export async function crawlController(
   req: RequestWithAuth<{}, CrawlResponse, CrawlRequest>,
@@ -29,9 +38,9 @@ export async function crawlController(
   }
 
   const zeroDataRetention =
-    req.acuc?.flags?.forceZDR || req.body.zeroDataRetention;
+    getScrapeZDR(req.acuc?.flags) === "forced" || req.body.zeroDataRetention;
 
-  const id = uuidv4();
+  const id = uuidv7();
   const logger = _logger.child({
     crawlId: id,
     module: "api/v1",
@@ -46,8 +55,20 @@ export async function crawlController(
     account: req.account,
   });
 
+  await logRequest({
+    id,
+    kind: "crawl",
+    api_version: "v1",
+    team_id: req.auth.team_id,
+    origin: req.body.origin ?? "api",
+    integration: req.body.integration,
+    target_hint: req.body.url,
+    zeroDataRetention: zeroDataRetention || false,
+    api_key_id: req.acuc?.api_key_id ?? null,
+  });
+
   let { remainingCredits } = req.account!;
-  const useDbAuthentication = process.env.USE_DB_AUTHENTICATION === "true";
+  const useDbAuthentication = config.USE_DB_AUTHENTICATION;
   if (!useDbAuthentication) {
     remainingCredits = Infinity;
   }
@@ -57,9 +78,12 @@ export async function crawlController(
     url: undefined,
     scrapeOptions: undefined,
   };
+
+  const bodyScrapeOptions =
+    req.body.scrapeOptions ?? ({} as typeof req.body.scrapeOptions);
   const { scrapeOptions, internalOptions } = fromV1ScrapeOptions(
-    req.body.scrapeOptions,
-    req.body.scrapeOptions.timeout,
+    bodyScrapeOptions,
+    bodyScrapeOptions.timeout,
     req.auth.team_id,
   );
 
@@ -100,10 +124,9 @@ export async function crawlController(
       ...internalOptions,
       disableSmartWaitCache: true,
       teamId: req.auth.team_id,
-      saveScrapeResultToGCS: process.env.GCS_FIRE_ENGINE_BUCKET_NAME
-        ? true
-        : false,
+      saveScrapeResultToGCS: config.GCS_FIRE_ENGINE_BUCKET_NAME ? true : false,
       zeroDataRetention,
+      agentIndexOnly: (req as any).agentIndexOnly ?? false,
     }, // NOTE: smart wait disabled for crawls to ensure contentful scrape, speed does not matter
     team_id: req.auth.team_id,
     createdAt: Date.now(),
@@ -120,17 +143,25 @@ export async function crawlController(
 
   try {
     sc.robots = await crawler.getRobotsTxt(scrapeOptions.skipTlsVerification);
-    const robotsCrawlDelay = crawler.getRobotsCrawlDelay();
-    if (robotsCrawlDelay !== null && !sc.crawlerOptions.delay) {
-      sc.crawlerOptions.delay = robotsCrawlDelay;
-    }
+    // const robotsCrawlDelay = crawler.getRobotsCrawlDelay();
+    // if (robotsCrawlDelay !== null && !sc.crawlerOptions.delay) {
+    //   sc.crawlerOptions.delay = robotsCrawlDelay;
+    // }
   } catch (e) {
     logger.debug("Failed to get robots.txt (this is probably fine!)", {
       error: e,
     });
   }
 
+  await crawlGroup.addGroup(
+    id,
+    sc.team_id,
+    (req.acuc?.flags?.crawlTtlHours ?? 24) * 60 * 60 * 1000,
+  );
+
   await saveCrawl(id, sc);
+
+  await markCrawlActive(id);
 
   await _addScrapeJobToBullMQ(
     {
@@ -142,16 +173,17 @@ export async function crawlController(
       internalOptions: sc.internalOptions,
       origin: req.body.origin,
       integration: req.body.integration,
+      billing: { endpoint: "crawl", jobId: id },
       crawl_id: id,
       webhook: req.body.webhook,
       v1: true,
       zeroDataRetention: zeroDataRetention || false,
       apiKeyId: req.acuc?.api_key_id ?? null,
     },
-    crypto.randomUUID(),
+    uuidv7(),
   );
 
-  const protocol = process.env.ENV === "local" ? req.protocol : "https";
+  const protocol = req.protocol;
 
   return res.status(200).json({
     success: true,

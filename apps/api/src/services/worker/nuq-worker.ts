@@ -1,16 +1,27 @@
 import "dotenv/config";
+import { config } from "../../config";
+import "../sentry";
+import { setSentryServiceTag } from "../sentry";
 import { logger as _logger } from "../../lib/logger";
 import { processJobInternal } from "./scrape-worker";
 import { scrapeQueue, nuqGetLocalMetrics, nuqHealthCheck } from "./nuq";
+import { jobDurationSeconds } from "../../lib/job-metrics";
+import { register } from "prom-client";
 import Express from "express";
 import { _ } from "ajv";
 import { initializeBlocklist } from "../../scraper/WebScraper/utils/blocklist";
+import { initializeEngineForcing } from "../../scraper/WebScraper/utils/engine-forcing";
 
 (async () => {
+  setSentryServiceTag("nuq-worker");
+
   try {
     await initializeBlocklist();
+    initializeEngineForcing();
   } catch (error) {
-    _logger.error("Failed to initialize blocklist", { error });
+    _logger.error("Failed to initialize blocklist and engine forcing", {
+      error,
+    });
     process.exit(1);
   }
 
@@ -18,8 +29,10 @@ import { initializeBlocklist } from "../../scraper/WebScraper/utils/blocklist";
 
   const app = Express();
 
-  app.get("/metrics", (_, res) =>
-    res.contentType("text/plain").send(nuqGetLocalMetrics()),
+  app.get("/metrics", async (_, res) =>
+    res
+      .contentType("text/plain")
+      .send(nuqGetLocalMetrics() + "\n" + (await register.metrics())),
   );
   app.get("/health", async (_, res) => {
     if (await nuqHealthCheck()) {
@@ -29,19 +42,18 @@ import { initializeBlocklist } from "../../scraper/WebScraper/utils/blocklist";
     }
   });
 
-  const server = app.listen(
-    Number(process.env.NUQ_WORKER_PORT ?? process.env.PORT ?? 3000),
-    () => {
-      _logger.info("NuQ worker metrics server started");
-    },
-  );
+  const server = app.listen(config.NUQ_WORKER_PORT, () => {
+    _logger.info("NuQ worker metrics server started");
+  });
 
   function shutdown() {
     isShuttingDown = true;
   }
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  if (require.main === module) {
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+  }
 
   let noJobTimeout = 1500;
 
@@ -51,7 +63,7 @@ import { initializeBlocklist } from "../../scraper/WebScraper/utils/blocklist";
     if (job === null) {
       _logger.info("No jobs to process", { module: "nuq/metrics" });
       await new Promise(resolve => setTimeout(resolve, noJobTimeout));
-      if (!process.env.NUQ_RABBITMQ_URL) {
+      if (!config.NUQ_RABBITMQ_URL) {
         noJobTimeout = Math.min(noJobTimeout * 2, 10000);
       }
       continue;
@@ -81,6 +93,8 @@ import { initializeBlocklist } from "../../scraper/WebScraper/utils/blocklist";
       | { ok: true; data: Awaited<ReturnType<typeof processJobInternal>> }
       | { ok: false; error: any };
 
+    const endJobTimer = jobDurationSeconds.startTimer({ type: job.data.mode });
+
     try {
       processResult = { ok: true, data: await processJobInternal(job) };
     } catch (error) {
@@ -90,6 +104,7 @@ import { initializeBlocklist } from "../../scraper/WebScraper/utils/blocklist";
     clearInterval(lockRenewInterval);
 
     if (processResult.ok) {
+      endJobTimer({ status: "success" });
       if (
         !(await scrapeQueue.jobFinish(
           job.id,
@@ -101,6 +116,7 @@ import { initializeBlocklist } from "../../scraper/WebScraper/utils/blocklist";
         logger.warn("Could not update job status");
       }
     } else {
+      endJobTimer({ status: "failed" });
       if (
         !(await scrapeQueue.jobFail(
           job.id,
