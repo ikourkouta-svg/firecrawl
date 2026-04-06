@@ -89,6 +89,10 @@ const configSchema = z.object({
   GCS_INDEX_BUCKET_NAME: z.string().optional(),
   GCS_MEDIA_BUCKET_NAME: z.string().optional(),
 
+  // ClickHouse (Search Analytics)
+  CLICKHOUSE_ANALYTICS_URL: z.string().optional(),
+  CLICKHOUSE_ANALYTICS_DATABASE: z.string().optional(),
+
   // Fire Engine
   FIRE_ENGINE_BETA_URL: z.string().optional(),
   FIRE_ENGINE_STAGING_URL: z.string().optional(),
@@ -230,6 +234,9 @@ const configSchema = z.object({
   SENTRY_ERROR_SAMPLE_RATE: z.coerce.number().default(0.05),
   SENTRY_ENVIRONMENT: z.string().default("production"),
   NUQ_POD_NAME: z.string().default("main"),
+
+  // Billing
+  AUTO_RECHARGE_ENABLED: z.stringbool().default(false),
 
   // Miscellaneous
   IDMUX_URL: z.string().optional(),
