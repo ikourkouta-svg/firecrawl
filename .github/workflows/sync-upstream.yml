@@ -10,7 +10,6 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
-  workflows: write
 
 jobs:
   sync:
@@ -56,6 +55,16 @@ jobs:
             echo "CONFLICTS=true" >> $GITHUB_ENV
             git merge --abort
             echo "Merge has conflicts — manual resolution needed"
+          }
+
+      - name: Revert upstream workflow changes
+        if: steps.check.outputs.already_current == 'false' && env.CONFLICTS != 'true'
+        run: |
+          # GITHUB_TOKEN can't push .github/workflows/ changes — revert them
+          git checkout HEAD~1 -- .github/workflows/ 2>/dev/null || true
+          git diff --quiet .github/workflows/ || {
+            git add .github/workflows/
+            git commit -m "chore: keep fork workflow files (strip upstream CI changes)"
           }
 
       - name: Create PR via REST API
