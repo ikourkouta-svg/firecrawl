@@ -60,9 +60,12 @@ jobs:
       - name: Revert upstream workflow changes
         if: steps.check.outputs.already_current == 'false' && env.CONFLICTS != 'true'
         run: |
-          # GITHUB_TOKEN can't push .github/workflows/ changes — restore fork's versions
+          # GITHUB_TOKEN can't push .github/workflows/ changes — wipe the dir and
+          # restore only the fork's versions so any upstream-added workflow files are removed.
+          rm -rf .github/workflows
           git checkout origin/main -- .github/workflows/
-          git diff --staged --quiet .github/workflows/ || {
+          git add -A .github/workflows/
+          git diff --cached --quiet .github/workflows/ || {
             git commit -m "chore: keep fork workflow files (strip upstream CI changes)"
           }
 
